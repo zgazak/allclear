@@ -6,6 +6,12 @@ All-sky camera cloud detection via stellar transmission mapping.
 geometry by matching detected stars against a catalog, and produces
 full-hemisphere cloud transmission maps with annotated PNG output.
 
+| Clear sky | Obscured sky |
+|:---------:|:------------:|
+| ![Clear sky](docs/clear_blink.gif) | ![Obscured sky](docs/obscured_blink.gif) |
+
+*Blink comparison: star identification (red circles = catalog, green crosshairs = matched) and transmission overlay (green = clear, red = cloudy).*
+
 ## How it works
 
 1. **Detection** -- Background-subtracted star detection using DAOStarFinder
