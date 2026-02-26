@@ -8,8 +8,8 @@ All-sky camera cloud detection via stellar transmission mapping.
 geometry by matching detected stars against a catalog, and produces
 full-hemisphere cloud transmission maps with annotated PNG output.
 
-| Clear sky | Obscured sky |
-|:---------:|:------------:|
+|             Clear sky              |               Obscured sky               |
+| :--------------------------------: | :--------------------------------------: |
 | ![Clear sky](docs/clear_blink.gif) | ![Obscured sky](docs/obscured_blink.gif) |
 
 *Blink comparison: star identification (red circles = catalog, green crosshairs = matched) and transmission overlay (green = clear, red = cloudy).*
@@ -32,7 +32,8 @@ pip install allclear
 Or with [uv](https://docs.astral.sh/uv/):
 
 ```
-uv pip install allclear
+uv add allclear
+uv sync
 ```
 
 Requires Python >= 3.10. Dependencies: numpy, scipy, astropy, photutils, matplotlib.
@@ -93,12 +94,12 @@ Reports overall clear fraction and transmission at a specific sky position.
 
 The fisheye projection model supports four lens types:
 
-| Type | Formula |
-|------|---------|
-| Equidistant | r = f * theta |
-| Equisolid | r = 2f * sin(theta/2) |
+| Type          | Formula               |
+| ------------- | --------------------- |
+| Equidistant   | r = f * theta         |
+| Equisolid     | r = 2f * sin(theta/2) |
 | Stereographic | r = 2f * tan(theta/2) |
-| Orthographic | r = f * sin(theta) |
+| Orthographic  | r = f * sin(theta)    |
 
 Parameters: optical center (cx, cy), boresight direction (az0, alt0),
 roll angle (rho), focal length (f), and radial distortion coefficients (k1, k2).
