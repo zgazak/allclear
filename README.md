@@ -1,6 +1,6 @@
 # allclear
 
-![Tests](tests.svg) ![Coverage](coverage.svg)
+![Tests](https://raw.githubusercontent.com/zgazak/allclear/main/tests.svg) ![Coverage](https://raw.githubusercontent.com/zgazak/allclear/main/coverage.svg)
 
 All-sky camera cloud detection via stellar transmission mapping.
 
@@ -10,7 +10,7 @@ full-hemisphere cloud transmission maps with annotated PNG output.
 
 |             Clear sky              |               Obscured sky               |
 | :--------------------------------: | :--------------------------------------: |
-| ![Clear sky](docs/clear_blink.gif) | ![Obscured sky](docs/obscured_blink.gif) |
+| ![Clear sky](https://raw.githubusercontent.com/zgazak/allclear/main/docs/clear_blink.gif) | ![Obscured sky](https://raw.githubusercontent.com/zgazak/allclear/main/docs/obscured_blink.gif) |
 
 *Blink comparison: star identification (red circles = catalog, green crosshairs = matched) and transmission overlay (green = clear, red = cloudy).*
 

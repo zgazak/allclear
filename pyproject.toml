@@ -3,7 +3,7 @@ name = "allclear"
 authors = [
   { name="Zach", email="jzg@alum.mit.edu" },
 ]
-version = "0.2.0"
+version = "0.2.1"
 description = "All-sky camera cloud detection via stellar transmission mapping"
 readme = "README.md"
 requires-python = ">=3.10"
