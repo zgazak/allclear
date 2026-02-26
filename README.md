@@ -1,5 +1,7 @@
 # allclear
 
+![Tests](tests.svg) ![Coverage](coverage.svg)
+
 All-sky camera cloud detection via stellar transmission mapping.
 
 `allclear` takes FITS images from all-sky cameras, blind-solves the camera
