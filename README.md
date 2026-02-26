@@ -24,24 +24,24 @@ full-hemisphere cloud transmission maps with annotated PNG output.
 ## Installation
 
 ```
-pip install -e ".[dev]"
+pip install allclear
 ```
 
 Or with [uv](https://docs.astral.sh/uv/):
 
 ```
-uv sync
+uv pip install allclear
 ```
 
 Requires Python >= 3.10. Dependencies: numpy, scipy, astropy, photutils, matplotlib.
 
-## Usage
+## Quick start
 
 ### 1. Characterize camera geometry (one-time)
 
 ```
 allclear instrument-fit \
-    --frames example_images/2023_11_19__00_00_11.fits \
+    --frames your_sky_image.fits \
     --lat 20.7458 --lon -156.4317 \
     --output instrument_model.json
 ```
@@ -50,17 +50,29 @@ This blind-solves the camera model and saves it as JSON, including a
 photometric zeropoint calibrated from the (presumably clear) input frame.
 Typically matches 400-550 stars at 2-3 pixel RMS.
 
+Supports FITS, JPG, PNG, and TIFF. For non-FITS images, provide the
+observation time with `--time`:
+
+```
+allclear instrument-fit \
+    --frames sky_photo.jpg \
+    --lat 20.7458 --lon -156.4317 \
+    --time "2024-01-15 03:30:00-10:00" \
+    --output instrument_model.json
+```
+
 ### 2. Process frames with known model (fast)
 
 ```
 allclear solve \
-    --frames "example_images/2023_11_19__00_*.fits" \
+    --frames "sky_images/*.fits" \
     --model instrument_model.json
 ```
 
 For each frame, produces:
 - `<stem>_solved.png` -- Annotated image with star matches (green crosshairs = matched, red circles = catalog)
 - `<stem>_transmission.png` -- Same image with RdYlGn transmission overlay (green = clear, red = cloudy/obstructed)
+- `<stem>_blink.gif` -- Animated blink between solved and transmission views
 
 Use `--no-plot` to suppress image output. Use `--output-dir <dir>` to write to a specific directory.
 
@@ -68,7 +80,7 @@ Use `--no-plot` to suppress image output. Use `--output-dir <dir>` to write to a
 
 ```
 allclear check \
-    --frame example_images/2023_11_19__00_00_11.fits \
+    --frame sky_image.fits \
     --model instrument_model.json \
     --target-ra 83.63 --target-dec -5.39 --target-name "Orion Nebula"
 ```
@@ -130,36 +142,12 @@ allclear/
 
 ## Development
 
-### Install with dev dependencies
-
-```
-uv pip install -e ".[dev]"
-```
-
-### Run tests
-
-```
-make test
-```
-
-### Publishing to PyPI
-
-Build and upload:
-
 ```bash
-make publish       # build + upload to PyPI
-make publish-test  # build + upload to TestPyPI (for dry runs)
+git clone https://github.com/zgazak/allclear.git
+cd allclear
+uv sync                          # install with dev dependencies
+uv run pytest allclear/tests/ -v # run tests (32 tests)
 ```
-
-Or manually:
-
-```bash
-make build                                     # creates dist/
-uv run twine upload dist/*                     # upload to PyPI
-uv run twine upload --repository testpypi dist/*  # upload to TestPyPI
-```
-
-Requires a `~/.pypirc` with your API token, or set `TWINE_USERNAME`/`TWINE_PASSWORD` env vars.
 
 ## License
 
