@@ -1,0 +1,68 @@
+[project]
+name = "allclear"
+authors = [
+  { name="Zach", email="jzg@alum.mit.edu" },
+]
+version = "0.2.0"
+description = "All-sky camera cloud detection via stellar transmission mapping"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE*"]
+keywords = ["astronomy", "cloud-detection", "all-sky", "fisheye", "photometry", "transmission"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "astropy",
+    "photutils",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.4.0",
+    "twine>=6.2.0",
+    "pytest",
+    "pytest-cov",
+]
+
+[project.scripts]
+allclear = "allclear.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zgazak/allclear"
+Issues = "https://github.com/zgazak/allclear/issues"
+
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "*.fits",
+    "*.png",
+    "*.gif",
+    "*.jpg",
+    "*.json",
+    "example_images/",
+    "catalog/",
+    "extr/",
+    ".claude/",
+    ".python-version",
+    "uv.lock",
+    "fit_distortion.py",
+    "ALLSKY_CLOUD_DETECTION_PROMPT.md",
+    "CLAUDE.md",
+]
