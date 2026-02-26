@@ -36,6 +36,7 @@ dev = [
     "twine>=6.2.0",
     "pytest",
     "pytest-cov",
+    "genbadge[coverage,tests]>=1.1.3",
 ]
 
 [project.scripts]

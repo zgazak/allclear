@@ -9,6 +9,7 @@ catalog/
 *.fits
 .python-version
 fit_distortion.py
+reports/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
