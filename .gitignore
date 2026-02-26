@@ -1,3 +1,15 @@
+# Project data & outputs
+example_images/
+extr/
+catalog/
+/*.png
+/*.gif
+/*.jpg
+/*.json
+*.fits
+.python-version
+fit_distortion.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
