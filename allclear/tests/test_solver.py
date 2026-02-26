@@ -1,101 +1,80 @@
-"""Tests for the all-sky camera solver."""
+"""Tests for the fast solver (known-model matching and refinement)."""
 
 import numpy as np
 import pytest
 from astropy.table import Table
 
 from allclear.projection import CameraModel, ProjectionType
-from allclear.solver import AllSkySolver
+from allclear.synthetic import generate_synthetic_frame
+from allclear.detection import detect_stars
+from allclear.solver import fast_solve
 
 
-class TestRefine:
-    """Test that refine() recovers known camera parameters."""
+class TestFastSolve:
+    """Test fast_solve with guided matching on synthetic data."""
 
-    def test_refine_recovers_params(self):
-        """Given a perturbed initial guess and correct matches, refine should
-        recover the true model."""
+    @pytest.fixture
+    def synthetic_scene(self):
+        """Generate a synthetic frame with known camera model."""
         true_model = CameraModel(
             cx=1548, cy=1040, az0=0.5, alt0=np.pi / 2 - 0.02,
             rho=0.3, f=750.0, proj_type=ProjectionType.EQUIDISTANT,
         )
 
-        # Generate fake catalog stars
         rng = np.random.default_rng(42)
-        n = 80
+        n = 200
         az_deg = rng.uniform(0, 360, n)
-        alt_deg = rng.uniform(20, 85, n)
-        cat = Table({"az_deg": az_deg, "alt_deg": alt_deg,
-                      "vmag_extinct": rng.uniform(1, 5, n)})
-
-        # Project through true model to get "detected" positions
-        az_rad = np.radians(az_deg)
-        alt_rad = np.radians(alt_deg)
-        x_true, y_true = true_model.sky_to_pixel(az_rad, alt_rad)
-
-        # Add small noise
-        x_det = x_true + rng.normal(0, 0.5, n)
-        y_det = y_true + rng.normal(0, 0.5, n)
-
-        # Filter to in-frame
-        mask = ((x_det >= 0) & (x_det < 3096) &
-                (y_det >= 0) & (y_det < 2080))
-        det = Table({"x": x_det[mask], "y": y_det[mask],
-                      "flux": rng.uniform(1000, 10000, np.sum(mask))})
-
-        # Perturbed initial model
-        init_model = CameraModel(
-            cx=1560, cy=1050, az0=0.55, alt0=np.pi / 2 - 0.01,
-            rho=0.35, f=740.0, proj_type=ProjectionType.EQUIDISTANT,
-        )
-
-        solver = AllSkySolver()
-        result = solver.refine(det, cat, init_model, max_dist=30.0)
-
-        rm = result.camera_model
-        assert abs(rm.cx - true_model.cx) < 5.0
-        assert abs(rm.cy - true_model.cy) < 5.0
-        assert abs(rm.f - true_model.f) / true_model.f < 0.02
-        assert result.rms_residual < 3.0
-        assert result.n_matched >= 20
-
-
-class TestCoarseSolve:
-    """Test coarse solve on synthetic data."""
-
-    def test_coarse_solve_synthetic(self):
-        """Coarse solve should find a reasonable initial model."""
-        true_model = CameraModel(
-            cx=1548, cy=1040, az0=0.0, alt0=np.pi / 2,
-            rho=0.0, f=750.0, proj_type=ProjectionType.EQUIDISTANT,
-        )
-
-        rng = np.random.default_rng(42)
-        n = 100
-        az_deg = rng.uniform(0, 360, n)
-        alt_deg = rng.uniform(25, 85, n)
-        vmag = rng.uniform(0, 5, n)
-        cat = Table({"az_deg": az_deg, "alt_deg": alt_deg,
-                      "vmag_extinct": vmag})
+        alt_deg = rng.uniform(15, 85, n)
+        vmag = np.concatenate([
+            rng.uniform(-0.5, 2.0, 30),
+            rng.uniform(2.0, 4.0, 70),
+            rng.uniform(4.0, 5.5, 100),
+        ])
+        cat = Table({
+            "az_deg": az_deg, "alt_deg": alt_deg,
+            "vmag": vmag, "vmag_extinct": vmag + 0.1,
+        })
         cat.sort("vmag_extinct")
 
-        az_rad = np.radians(az_deg)
-        alt_rad = np.radians(alt_deg)
-        x_true, y_true = true_model.sky_to_pixel(az_rad, alt_rad)
+        image, truth = generate_synthetic_frame(
+            camera_model=true_model, star_table=cat,
+            sky_background=200, read_noise=10,
+            flux_scale=5e6, psf_sigma=2.5, seed=42,
+        )
 
-        x_det = x_true + rng.normal(0, 1.0, n)
-        y_det = y_true + rng.normal(0, 1.0, n)
+        det = detect_stars(image, fwhm=5.0, threshold_sigma=3.0,
+                           n_brightest=200)
 
-        mask = ((x_det >= 0) & (x_det < 3096) &
-                (y_det >= 0) & (y_det < 2080))
-        det = Table({"x": x_det[mask], "y": y_det[mask],
-                      "flux": 10**(4 - 0.4 * vmag[mask])})
-        det.sort("flux")
-        det.reverse()
+        return true_model, image, det, cat
 
-        solver = AllSkySolver()
-        model, matches = solver.coarse_solve(det, cat, initial_f=750.0)
+    def test_exact_model_matches_stars(self, synthetic_scene):
+        """With the exact model, fast_solve should find many matches."""
+        true_model, image, det, cat = synthetic_scene
 
-        assert model is not None
-        assert len(matches) >= 4
-        # Focal length should be in the right ballpark
-        assert abs(model.f - 750.0) / 750.0 < 0.3
+        result = fast_solve(image, det, cat, true_model,
+                            refine=False, guided=True)
+
+        assert result.n_matched >= 30
+        assert result.rms_residual < 3.0
+
+    def test_refine_recovers_perturbed_model(self, synthetic_scene):
+        """Given a slightly perturbed model, refine should recover accuracy."""
+        true_model, image, det, cat = synthetic_scene
+
+        perturbed = CameraModel(
+            cx=true_model.cx + 8,
+            cy=true_model.cy - 5,
+            az0=true_model.az0 + np.radians(1.0),
+            alt0=true_model.alt0 - np.radians(0.5),
+            rho=true_model.rho + np.radians(0.8),
+            f=true_model.f * 1.01,
+            proj_type=true_model.proj_type,
+        )
+
+        result = fast_solve(image, det, cat, perturbed,
+                            refine=True, guided=True)
+
+        assert result.n_matched >= 20
+        assert result.rms_residual < 5.0
+        # Refined model should be closer to truth than the perturbed input
+        assert abs(result.camera_model.f - true_model.f) < abs(perturbed.f - true_model.f)
