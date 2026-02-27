@@ -58,6 +58,14 @@ def load_fits_image(path):
     if data is None:
         raise ValueError(f"No image data in FITS file {path}")
 
+    # Handle image cubes (e.g. color FITS with shape (nchannels, H, W))
+    if data.ndim == 3:
+        data = data[0]
+        warnings.warn(
+            f"FITS image has {header.get('NAXIS3', '?')} channels; "
+            "using first channel only."
+        )
+
     # Ensure native byte order float64
     data = np.asarray(data, dtype=np.float64)
     return data, header
