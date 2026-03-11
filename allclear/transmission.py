@@ -14,9 +14,43 @@ class TransmissionMap:
     transmission: np.ndarray  # (N_alt, N_az)
     zeropoint: float
 
+    def query(self, az_deg, alt_deg):
+        """Look up interpolated transmission at a sky position.
+
+        Parameters
+        ----------
+        az_deg, alt_deg : float
+            Azimuth and altitude in degrees.
+
+        Returns
+        -------
+        float
+            Transmission value (0=opaque, 1=clear). NaN if outside grid.
+        """
+        if alt_deg < float(self.alt_grid[0]) or alt_deg > float(self.alt_grid[-1]):
+            return float("nan")
+        az_idx = int(np.argmin(np.abs(self.az_grid - (az_deg % 360))))
+        alt_idx = int(np.argmin(np.abs(self.alt_grid - alt_deg)))
+        return float(self.transmission[alt_idx, az_idx])
+
     def get_observability_mask(self, threshold=0.7):
         """Return boolean mask where transmission >= threshold."""
         return self.transmission >= threshold
+
+    def to_dict(self):
+        """Serialize to a JSON-compatible dict.
+
+        Returns a compact representation with the grid axes and
+        transmission values (rounded to 3 decimal places).
+        """
+        trans = self.transmission.copy()
+        trans = np.where(np.isnan(trans), None, np.round(trans, 3))
+        return {
+            "az_grid_deg": self.az_grid.tolist(),
+            "alt_grid_deg": self.alt_grid.tolist(),
+            "transmission": [[v for v in row] for row in trans],
+            "zeropoint": round(self.zeropoint, 4),
+        }
 
     def to_image(self, cmap="gray_r", vmin=0, vmax=1.2):
         """Render as a matplotlib figure."""
