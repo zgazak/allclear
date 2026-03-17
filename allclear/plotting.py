@@ -55,6 +55,7 @@ def zscale(data, contrast=0.2):
 
 def plot_frame(image, camera_model, det_table=None, cat_table=None,
                matched_pairs=None, show_grid=True, transmission_data=None,
+               overlay_mode="transmission",
                obs_time=None, lat_deg=None, lon_deg=None,
                output_path=None, dpi=None):
     """Render an annotated all-sky camera frame.
@@ -111,7 +112,7 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
     if transmission_data is not None:
         trans_az, trans_alt, trans_vals = transmission_data
         _overlay_transmission(ax, camera_model, trans_az, trans_alt,
-                              trans_vals, nx, ny)
+                              trans_vals, nx, ny, mode=overlay_mode)
 
     # Az/Alt grid
     if show_grid:
@@ -130,6 +131,22 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
     ax.set_ylim(0, ny - 1)
     ax.set_xticks([])
     ax.set_yticks([])
+
+    # Timestamp (top left)
+    if obs_time is not None:
+        shift_t = 0.005 * np.array(image.shape)
+        ax.text(
+            shift_t[1],
+            ny - shift_t[0],
+            obs_time.iso,
+            color="white",
+            ha="left",
+            va="top",
+            size=_font_size(image) * 1.2,
+            alpha=0.8,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="black",
+                      alpha=0.6, edgecolor="none"),
+        )
 
     # Version watermark
     shift = 0.005 * np.array(image.shape)
@@ -152,7 +169,7 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
     if output_path:
         from pathlib import Path
         output_path = Path(output_path)
-        plt.savefig(output_path, dpi=dpi, bbox_inches="tight", pad_inches=0)
+        plt.savefig(output_path, dpi=dpi, pad_inches=0)
         plt.close(fig)
         return None
     else:
@@ -207,8 +224,10 @@ def _draw_altaz_grid(ax, camera_model, nx, ny):
         _plot_segments(ax, xv, yv, nx, color="white", linestyle="--",
                        alpha=0.6, linewidth=1.0)
 
-        # Label at one in-frame point
-        in_frame = (xv >= 0) & (xv < nx) & (yv >= 0) & (yv < ny)
+        # Label at one in-frame point (with margin so text isn't clipped)
+        margin = fs * 2
+        in_frame = ((xv >= margin) & (xv < nx - margin)
+                    & (yv >= margin) & (yv < ny - margin))
         if np.any(in_frame):
             idx = np.where(in_frame)[0][len(in_frame[in_frame]) // 2]
             ax.text(xv[idx], yv[idx], f"{alt_deg}\u00b0",
@@ -231,10 +250,12 @@ def _draw_altaz_grid(ax, camera_model, nx, ny):
         _plot_segments(ax, xv, yv, nx, color="white", linestyle="--",
                        alpha=0.6, linewidth=1.0)
 
-        # Cardinal direction label at alt=5° end
+        # Cardinal direction label at alt=5° end (with margin)
         lx, ly = camera_model.sky_to_pixel(np.radians(az_deg), np.radians(5))
+        margin = fs * 2.5
         if (np.isfinite(lx) and np.isfinite(ly)
-                and 0 <= lx < nx and 0 <= ly < ny):
+                and margin <= lx < nx - margin
+                and margin <= ly < ny - margin):
             label = cardinal_names.get(az_deg, f"{az_deg}\u00b0")
             ax.text(float(lx), float(ly), label,
                     ha="center", va="center",
@@ -360,7 +381,7 @@ def _draw_stars(ax, det_table, cat_table, matched_pairs, camera_model,
 
 
 def _overlay_transmission(ax, camera_model, trans_az, trans_alt, trans_vals,
-                          nx, ny):
+                          nx, ny, mode="transmission"):
     """Overlay a semi-transparent transmission colormap on the image.
 
     Builds a pixel-space transmission image by projecting through the camera
@@ -423,11 +444,59 @@ def _overlay_transmission(ax, camera_model, trans_az, trans_alt, trans_vals,
     trans_img = trans_img.reshape(xx.shape)
     trans_img = np.clip(trans_img, 0, 1.2)
 
-    ax.imshow(
-        trans_img, cmap="RdYlGn", alpha=0.55, origin="lower",
-        extent=[0, nx, 0, ny], vmin=0, vmax=1.2,
+    if mode == "extinction":
+        # Convert transmission to extinction magnitude
+        safe_trans = np.where(trans_img > 1e-4, trans_img, 1e-4)
+        display_img = np.clip(-2.5 * np.log10(safe_trans), 0, 10.0)
+        cmap, vmin, vmax = "inferno_r", 0, 10.0
+        ticks = [0, 1, 2, 5, 10]
+        tick_labels = ["0", "1", "2", "5", "10"]
+        cb_label = "Extinction (mag)"
+    else:
+        display_img = trans_img
+        cmap, vmin, vmax = "RdYlGn", 0, 1.2
+        ticks = [0, 0.25, 0.5, 0.75, 1.0]
+        tick_labels = ["0%", "25%", "50%", "75%", "100%"]
+        cb_label = "Transmission"
+
+    im = ax.imshow(
+        display_img, cmap=cmap, alpha=0.55, origin="lower",
+        extent=[0, nx, 0, ny], vmin=vmin, vmax=vmax,
         interpolation="bilinear",
     )
+
+    # Inset colorbar with semi-transparent background box
+    from matplotlib.patches import FancyBboxPatch
+
+    fs = _font_size(np.empty((ny, nx)))
+
+    # Position: bottom-right, well inside the image bounds.
+    # Label goes above the bar so nothing extends toward the edge.
+    bar_x, bar_y, bar_w, bar_h = 0.62, 0.025, 0.34, 0.012
+    pad = 0.008
+    box_x = bar_x - pad
+    box_y = bar_y - pad
+    box_w = bar_w + 2 * pad
+    box_h = bar_h + 2 * pad + 0.018
+
+    bg = FancyBboxPatch(
+        (box_x, box_y), box_w, box_h,
+        boxstyle="round,pad=0.008",
+        transform=ax.transAxes,
+        facecolor="black", alpha=0.65, edgecolor="white",
+        linewidth=0.8, zorder=5,
+    )
+    ax.add_patch(bg)
+
+    cax = ax.inset_axes([bar_x, bar_y, bar_w, bar_h], zorder=6)
+    cb = ax.figure.colorbar(im, cax=cax, orientation="horizontal")
+    cb.set_ticks(ticks)
+    cb.set_ticklabels(tick_labels, size=fs * 0.7, color="white")
+    cb.ax.tick_params(colors="white", length=2, pad=2)
+    # Title above the bar
+    cb.ax.set_title(cb_label, size=fs * 0.8, color="white", pad=4)
+    cb.outline.set_edgecolor("white")
+    cb.outline.set_linewidth(0.5)
 
 
 def _draw_planets(ax, camera_model, obs_time, lat_deg, lon_deg, nx, ny):

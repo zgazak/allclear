@@ -241,10 +241,17 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt):
 
 
 def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
-                  background):
+                  background, min_contrast=500):
     """Find the bright peak nearest each projected catalog star.
 
     Returns list of (cat_idx, det_x, det_y, peak_val).
+
+    Parameters
+    ----------
+    min_contrast : float
+        Minimum peak - local_background required.  Rejects matches where
+        the bright pixel is not a genuine point source above the local
+        background (e.g. noise spikes on overcast frames).
     """
     ny, nx = image.shape
     matches = []
@@ -259,6 +266,16 @@ def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
         box = image[yi - r:yi + r + 1, xi - r:xi + r + 1]
         max_val = float(np.max(box))
         if max_val < min_peak:
+            continue
+
+        # Local contrast check: peak must stand out above the box edge
+        # pixels (local background), not just the global median.  This
+        # rejects hot pixels and noise on bright overcast frames.
+        edge = np.concatenate([
+            box[0, :], box[-1, :], box[1:-1, 0], box[1:-1, -1]
+        ]).astype(np.float64)
+        local_bg = float(np.median(edge))
+        if max_val - local_bg < min_contrast:
             continue
 
         # Centroid around the peak pixel

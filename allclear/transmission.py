@@ -18,6 +18,15 @@ class TransmissionMap:
         """Return boolean mask where transmission >= threshold."""
         return self.transmission >= threshold
 
+    @property
+    def extinction_mag(self):
+        """Extinction penalty in magnitudes: delta_mag = -2.5 * log10(T).
+
+        Returns 10.0 where transmission is effectively zero.
+        """
+        safe = np.clip(self.transmission, 1e-4, None)
+        return np.clip(-2.5 * np.log10(safe), 0, 10.0)
+
     def to_image(self, cmap="gray_r", vmin=0, vmax=1.2):
         """Render as a matplotlib figure."""
         import matplotlib.pyplot as plt

@@ -108,8 +108,8 @@ def parse_fits_header(header):
     obs_time_str = header.get("DATE-OBS") or header.get("DATE")
     obs_time = Time(obs_time_str, scale="utc")
 
-    lat_deg = _parse_dms(header["SITELAT"])
-    lon_deg = _parse_dms(header["SITELONG"])
+    lat_deg = _parse_dms(header["SITELAT"]) if "SITELAT" in header else None
+    lon_deg = _parse_dms(header["SITELONG"]) if "SITELONG" in header else None
 
     exposure = float(header.get("EXPOSURE", 1.0))
     focal_mm = float(header.get("FOCAL", 1.8))
