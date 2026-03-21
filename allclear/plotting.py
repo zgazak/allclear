@@ -56,7 +56,8 @@ def zscale(data, contrast=0.2):
 def plot_frame(image, camera_model, det_table=None, cat_table=None,
                matched_pairs=None, show_grid=True, transmission_data=None,
                obs_time=None, lat_deg=None, lon_deg=None,
-               output_path=None, dpi=None):
+               output_path=None, dpi=None, horizon_r=None,
+               horizon_center=None):
     """Render an annotated all-sky camera frame.
 
     Parameters
@@ -117,6 +118,17 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
     if show_grid:
         _draw_altaz_grid(ax, camera_model, nx, ny)
 
+    # Horizon circle (measured sky/ground boundary)
+    if horizon_r is not None:
+        hcx = horizon_center[0] if horizon_center else camera_model.cx
+        hcy = horizon_center[1] if horizon_center else camera_model.cy
+        horizon_circle = Circle(
+            (hcx, hcy), horizon_r,
+            fill=False, edgecolor='#4488ff', linewidth=2.0,
+            linestyle='--', alpha=0.9,
+        )
+        ax.add_patch(horizon_circle)
+
     # Stars
     if matched_pairs is not None:
         _draw_stars(ax, det_table, cat_table, matched_pairs,
@@ -130,6 +142,27 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
     ax.set_ylim(0, ny - 1)
     ax.set_xticks([])
     ax.set_yticks([])
+
+    # Legend
+    if matched_pairs is not None and cat_table is not None:
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import FancyBboxPatch
+        fs = _font_size(image) * 0.85
+        legend_items = [
+            Line2D([0], [0], marker='s', color='none', markeredgecolor='#44ff44',
+                   markerfacecolor='none', markersize=fs*0.9, markeredgewidth=1.2,
+                   label='Matched (detected)'),
+            Line2D([0], [0], marker='o', color='none', markeredgecolor='#44ff44',
+                   markerfacecolor='none', markersize=fs*0.9, markeredgewidth=1.2,
+                   label='Matched (catalog)'),
+            Line2D([0], [0], marker='o', color='none', markeredgecolor='#ff4444',
+                   markerfacecolor='none', markersize=fs*0.9, markeredgewidth=1.2,
+                   label='Catalog (predicted)'),
+        ]
+        leg = ax.legend(handles=legend_items, loc='lower left',
+                        fontsize=fs, framealpha=0.6,
+                        facecolor='black', edgecolor='gray',
+                        labelcolor='white')
 
     # Version watermark
     shift = 0.005 * np.array(image.shape)

@@ -488,10 +488,12 @@ def ransac_refine(image, cat_az_rad, cat_alt_rad, model,
     """
     ny, nx = image.shape
     background = float(np.median(image))
+    p999 = float(np.percentile(image, 99.9))
+    adaptive_mpo = max(500, min(3000, 0.5 * (p999 - background)))
 
     # Generate candidate matches via guided matching at generous radius
     matches = _guided_match(image, model, cat_az_rad, cat_alt_rad,
-                            search_radius=20, min_peak=background + 2000,
+                            search_radius=20, min_peak=background + adaptive_mpo,
                             background=background,
                             alt_min_rad=np.radians(15),
                             alt_max_rad=np.radians(75))
@@ -689,6 +691,8 @@ def center_outward_refine(image, cat_az_rad, cat_alt_rad, model,
     """
     ny, nx = image.shape
     background = float(np.median(image))
+    p999 = float(np.percentile(image, 99.9))
+    _mpo = max(500, min(3000, 0.5 * (p999 - background)))
     max_r = min(nx, ny) * 0.5
 
     current = model
@@ -717,7 +721,7 @@ def center_outward_refine(image, cat_az_rad, cat_alt_rad, model,
         # Guided match in this ring
         search_r = max(8, int(20 - 3 * ring))
         matches = _guided_match(image, current, ring_az, ring_alt,
-                                search_r, background + 2000, background)
+                                search_r, background + _mpo, background)
 
         for m in matches:
             all_det_x.append(m[1])
@@ -915,11 +919,10 @@ def _fit_model_to_pairs(det_x, det_y, cat_az, cat_alt, model,
 
     # Compute physically meaningful distortion bounds based on focal length.
     # At r = f (zenith angle ~1 rad), we want |k1*r^2| < 0.3 and |k2*r^4| < 0.15
-    # Fisheye lenses have barrel distortion (k1 ≤ 0).  Allow a small positive
-    # margin (5%) to avoid hard-clipping near zero.
+    # Fisheye lenses have barrel distortion (k1 ≤ 0).
     f0 = model.f
     k1_max = 0.3 / (f0 * f0)          # typically ~2.5e-7 for f=1100
-    k1_hi = k1_max * 0.05             # constrain k1 to be mostly ≤ 0
+    k1_hi = 0.0                        # k1 must be ≤ 0 for fisheye
     k2_max = 0.15 / (f0 ** 4)          # typically ~1e-13 for f=1100
 
     if fit_distortion:
@@ -1458,7 +1461,7 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
 # ---------------------------------------------------------------------------
 
 def guided_refine(image, cat_az, cat_alt, model, n_iterations=12,
-                  bright_mag_limit=None, min_peak_offset=3000,
+                  bright_mag_limit=None, min_peak_offset=None,
                   alt_min_deg=None, alt_max_deg=None, fix_az0=False,
                   fit_distortion=False,
                   horizon_r=None, horizon_weight=1.0):
@@ -1475,8 +1478,9 @@ def guided_refine(image, cat_az, cat_alt, model, n_iterations=12,
     n_iterations : int
         Number of refinement iterations.
     bright_mag_limit : ignored (kept for API compat)
-    min_peak_offset : float
+    min_peak_offset : float or None
         Minimum peak above background for guided matching.
+        If None, computed adaptively from image dynamic range.
     alt_min_deg, alt_max_deg : float or None
         If set, only match stars within this altitude range (degrees).
         Use to exclude near-zenith (degenerate) and near-horizon (noisy)
@@ -1511,6 +1515,10 @@ def guided_refine(image, cat_az, cat_alt, model, n_iterations=12,
     )
     n_matched = 0
     rms = 999.0
+
+    if min_peak_offset is None:
+        p999 = float(np.percentile(image, 99.9))
+        min_peak_offset = max(500, min(3000, 0.5 * (p999 - background)))
 
     alt_min_rad = np.radians(alt_min_deg) if alt_min_deg is not None else None
     alt_max_rad = np.radians(alt_max_deg) if alt_max_deg is not None else None
@@ -1658,9 +1666,14 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
                           threshold=None, r_min=400, r_max=None):
     """Detect the sky/dome boundary circle in an all-sky image.
 
-    Traces radially outward from center at many azimuthal angles to find
-    where the brightness drops below threshold.  Fits a circle to the
-    boundary points.
+    Uses two methods and picks the larger radius:
+
+    1. **Threshold method**: traces radially outward to find where
+       brightness drops below a threshold (works for high-contrast
+       dome/sky boundaries).
+    2. **Gradient method**: finds the steepest brightness drop along
+       each radial ray (works for low-contrast edges like buildings
+       against sky, or cameras without a dome).
 
     Parameters
     ----------
@@ -1695,52 +1708,123 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
     if r_max is None:
         r_max = np.sqrt(cx_est**2 + cy_est**2) + 200
 
-    # Determine threshold: sample the sky brightness and dark level
+    # Determine threshold between sky and dark levels.
+    # Sky = median brightness in the center; dark = median of the image
+    # corners (outside any sky circle).
     if threshold is None:
-        # Sky level: median brightness near the center (r < r_min)
         ys, xs = np.mgrid[:ny, :nx]
         r_img = np.sqrt((xs - cx_est)**2 + (ys - cy_est)**2)
         sky_mask = r_img < r_min
         sky_level = float(np.median(img[sky_mask]))
-        # Threshold at 60% of sky level (between sky and dark)
-        threshold = sky_level * 0.6
+        # Dark level: corners of the image (beyond possible sky circle)
+        corner_r = min(cx_est, cy_est, nx - cx_est, ny - cy_est)
+        dark_mask = r_img > corner_r * 1.3
+        if np.sum(dark_mask) > 100:
+            dark_level = float(np.median(img[dark_mask]))
+        else:
+            dark_level = float(np.percentile(img, 5))
+        # Threshold halfway between dark and sky
+        threshold = dark_level + (sky_level - dark_level) * 0.5
 
-    # Trace outward at many angles
     n_angles = 180
     angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-    boundary_points = []
+    step = 3
 
+    # --- Method 1: Threshold (original) ---
+    thresh_points = []
     for angle in angles:
         dx, dy = np.cos(angle), np.sin(angle)
-        for r in np.arange(r_min, r_max, 3):
+        for r in np.arange(r_min, r_max, step):
             xi = int(round(cx_est + r * dx))
             yi = int(round(cy_est + r * dy))
             if xi < 3 or xi >= nx - 3 or yi < 3 or yi >= ny - 3:
                 break
-            # Median of small box to avoid single-pixel noise
             val = float(np.median(img[yi - 2:yi + 3, xi - 2:xi + 3]))
             if val < threshold:
-                boundary_points.append((float(xi), float(yi)))
+                thresh_points.append((float(xi), float(yi)))
                 break
 
-    if len(boundary_points) < 10:
-        # Fallback: return center estimate with radius from image size
+    # --- Method 2: Steepest gradient per ray ---
+    grad_points = []
+    for angle in angles:
+        dx, dy = np.cos(angle), np.sin(angle)
+        radii_ray = []
+        vals_ray = []
+        for r in np.arange(r_min, r_max, step):
+            xi = int(round(cx_est + r * dx))
+            yi = int(round(cy_est + r * dy))
+            if xi < 3 or xi >= nx - 3 or yi < 3 or yi >= ny - 3:
+                break
+            val = float(np.median(img[yi - 2:yi + 3, xi - 2:xi + 3]))
+            radii_ray.append(r)
+            vals_ray.append(val)
+
+        if len(vals_ray) < 10:
+            continue
+        vals_arr = np.array(vals_ray)
+        # Smooth to avoid noise-driven gradients
+        from scipy.ndimage import uniform_filter1d
+        smooth_vals = uniform_filter1d(vals_arr, size=7)
+        grad = np.gradient(smooth_vals)
+        # Find steepest drop in outer half of ray
+        outer_start = len(grad) // 2
+        if outer_start < 1:
+            continue
+        min_idx = np.argmin(grad[outer_start:]) + outer_start
+        # Only accept if the drop is significant
+        if grad[min_idx] < -0.5:
+            r_edge = radii_ray[min_idx]
+            xi_e = cx_est + r_edge * dx
+            yi_e = cy_est + r_edge * dy
+            grad_points.append((float(xi_e), float(yi_e)))
+
+    # Fit circles from both methods with iterative outlier rejection.
+    # Buildings/structures intrude into the sky circle, pulling boundary
+    # points inward.  We iteratively fit, reject points far INSIDE the
+    # circle (these hit obstructions), and refit.
+    results = []
+    for label, points in [("threshold", thresh_points),
+                          ("gradient", grad_points)]:
+        if len(points) < 10:
+            continue
+        bp = np.array(points)
+
+        for _clip_iter in range(3):
+            bx, by = bp[:, 0], bp[:, 1]
+            A = np.column_stack([-2 * bx, -2 * by, np.ones(len(bx))])
+            b_vec = -(bx**2 + by**2)
+            lstsq = np.linalg.lstsq(A, b_vec, rcond=None)
+            cx_f = lstsq[0][0]
+            cy_f = lstsq[0][1]
+            c_val = lstsq[0][2]
+            R_f = np.sqrt(max(0, cx_f**2 + cy_f**2 - c_val))
+
+            # Reject points that are far inside the fitted circle
+            # (buildings/obstructions).  Keep points near or outside.
+            dists = np.sqrt((bx - cx_f)**2 + (by - cy_f)**2)
+            residuals = dists - R_f  # negative = inside circle
+            # Keep points within 1 sigma of the circle or outside it
+            sigma = float(np.std(residuals))
+            keep = residuals > -1.5 * sigma
+            if np.sum(keep) < 10:
+                break
+            bp = bp[keep]
+
+        # Reject fits where center is far from estimate
+        if abs(cx_f - cx_est) > nx * 0.3 or abs(cy_f - cy_est) > ny * 0.3:
+            continue
+        results.append((cx_f, cy_f, R_f, len(bp), label))
+
+    if not results:
         return cx_est, cy_est, min(cx_est, cy_est) * 0.8, 0
 
-    bp = np.array(boundary_points)
-    bx, by = bp[:, 0], bp[:, 1]
-
-    # Fit circle: (x-cx)^2 + (y-cy)^2 = R^2
-    # Linearize: -2*cx*x - 2*cy*y + (cx^2 + cy^2 - R^2) = -(x^2 + y^2)
-    A = np.column_stack([-2 * bx, -2 * by, np.ones(len(bx))])
-    b_vec = -(bx**2 + by**2)
-    result = np.linalg.lstsq(A, b_vec, rcond=None)
-    cx_fit = result[0][0]
-    cy_fit = result[0][1]
-    c_val = result[0][2]
-    R_fit = np.sqrt(max(0, cx_fit**2 + cy_fit**2 - c_val))
-
-    return cx_fit, cy_fit, R_fit, len(boundary_points)
+    # Pick the result with the largest radius — the threshold method
+    # tends to fire early on internal features, while the gradient
+    # method finds the true sky edge.
+    best = max(results, key=lambda x: x[2])
+    log.info("  Horizon methods: %s",
+             ", ".join(f"{r[4]}=(R={r[2]:.0f}, n={r[3]})" for r in results))
+    return best[0], best[1], best[2], best[3]
 
 
 def _make_detection_score_map(det_table, image_shape, sigma=3.0):
@@ -1916,7 +2000,7 @@ def brightness_parameter_sweep(det_table, image_shape,
 
 
 def _guided_match_count(image, model, cat_az, cat_alt, search_radius=15,
-                        min_peak_offset=2000, require_compact=True):
+                        min_peak_offset=None, require_compact=True):
     """Count guided matches, optionally requiring point-source morphology.
 
     For each catalog star, project to pixel position and check if there's
@@ -1933,8 +2017,8 @@ def _guided_match_count(image, model, cat_az, cat_alt, search_radius=15,
         Catalog positions (radians).
     search_radius : int
         Pixel search radius around projected position.
-    min_peak_offset : float
-        Minimum peak above background.
+    min_peak_offset : float or None
+        Minimum peak above background.  If None, computed from image.
     require_compact : bool
         If True, only count matches where the peak is point-source-like
         (inner box significantly brighter than surrounding annulus).
@@ -1949,6 +2033,9 @@ def _guided_match_count(image, model, cat_az, cat_alt, search_radius=15,
     """
     ny, nx = image.shape
     background = float(np.median(image))
+    if min_peak_offset is None:
+        p999 = float(np.percentile(image, 99.9))
+        min_peak_offset = max(500, min(3000, 0.5 * (p999 - background)))
     min_peak = background + min_peak_offset
 
     px, py = model.sky_to_pixel(cat_az, cat_alt)
@@ -2285,6 +2372,15 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     cy0 = ny / 2.0
     diag = {}
 
+    # Adaptive min_peak_offset: scale to the image's dynamic range.
+    # Use 50% of (p99.9 - median), floored at 500 and capped at 3000.
+    background = float(np.median(image))
+    p999 = float(np.percentile(image, 99.9))
+    min_peak_offset = max(500, min(3000, 0.5 * (p999 - background)))
+    if verbose:
+        log.info(f"  Adaptive min_peak_offset: {min_peak_offset:.0f} "
+                 f"(bg={background:.0f}, p99.9={p999:.0f})")
+
     cat_az_deg = np.asarray(cat_table["az_deg"], dtype=np.float64)
     cat_alt_deg = np.asarray(cat_table["alt_deg"], dtype=np.float64)
     vmag_ext = np.asarray(cat_table["vmag_extinct"], dtype=np.float64)
@@ -2357,13 +2453,60 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     pm_det_x = np.asarray(det_table["x"], dtype=np.float64)
     pm_det_y = np.asarray(det_table["y"], dtype=np.float64)
 
-    pm_model, pm_n, pm_rms, pm_diag = pattern_match_solve(
-        pm_det_x, pm_det_y, cat_az, cat_alt, vmag_ext,
-        cx=cx_est, cy=cy_est, nx=nx, ny=ny,
-        f_range=(max(400, f_from_horizon * 0.6),
-                 f_from_horizon * 2.0),
-        verbose=verbose,
-    )
+    # Try multiple f_range windows centered on the horizon-implied f.
+    # For an all-sky camera, the horizon constrains f tightly:
+    # f ≈ R_horizon / (π/2).  We allow ±50% to accommodate distortion
+    # and projection-type uncertainty, but don't search wildly different
+    # focal lengths that produce physically impossible solutions.
+    f_lo = max(250, f_from_horizon * 0.5)
+    f_hi = max(f_from_horizon * 1.5, 1500)
+    f_mid = f_from_horizon
+    f_ranges = [
+        (f_lo, f_mid),
+        (f_mid * 0.75, f_hi),
+    ]
+    # Ensure at least one range covers the horizon estimate
+    f_ranges.append((max(250, f_from_horizon * 0.6),
+                     f_from_horizon * 1.5))
+
+    pm_model = None
+    pm_n = 0
+    pm_rms = 999.0
+    pm_diag = {}
+    pm_candidates = []
+
+    for fri, fr in enumerate(f_ranges):
+        m, n, r, d = pattern_match_solve(
+            pm_det_x, pm_det_y, cat_az, cat_alt, vmag_ext,
+            cx=cx_est, cy=cy_est, nx=nx, ny=ny,
+            f_range=fr, verbose=verbose,
+        )
+        if m is not None and n >= 10:
+            pm_candidates.append((m, n, r, d, fr))
+            if verbose:
+                log.info(f"  f_range {fr[0]:.0f}-{fr[1]:.0f}: "
+                         f"{n} matches, RMS={r:.1f}, f={m.f:.0f}")
+
+    if pm_candidates:
+        # Filter by horizon consistency: for an all-sky camera, f must
+        # produce a horizon radius close to what we observed.  Reject
+        # solutions where f is far from the horizon-implied value.
+        if hr is not None and f_from_horizon > 100:
+            consistent = [c for c in pm_candidates
+                          if abs(c[0].f - f_from_horizon) / f_from_horizon < 0.35]
+            if consistent:
+                pm_candidates = consistent
+                if verbose:
+                    log.info("  Horizon filter: kept %d/%d candidates "
+                             "(f within 35%% of %.0f)",
+                             len(consistent),
+                             len(pm_candidates) + len(consistent) - len(consistent),
+                             f_from_horizon)
+
+        # Pick candidate with lowest RMS (more reliable than match count
+        # for discriminating correct vs coincidental solutions)
+        pm_candidates.sort(key=lambda c: c[2])
+        pm_model, pm_n, pm_rms, pm_diag, _ = pm_candidates[0]
     diag["pattern_match"] = pm_diag
 
     if pm_model is not None and pm_n >= 10:
@@ -2394,6 +2537,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         m3, n3, rms3 = guided_refine(
             image, med_az, med_alt, grid_model,
             n_iterations=15,
+            min_peak_offset=min_peak_offset,
             alt_min_deg=15, alt_max_deg=75,
             fix_az0=True,
             horizon_r=hr, horizon_weight=1.0,
@@ -2401,6 +2545,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         m4, n4, rms4 = guided_refine(
             image, med_az, med_alt, m3,
             n_iterations=15,
+            min_peak_offset=min_peak_offset,
             alt_min_deg=5, alt_max_deg=88,
             fix_az0=True,
             horizon_r=hr, horizon_weight=1.0,
@@ -2436,11 +2581,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
 
     if hc_n >= 20:
         # Get matched pairs from the geometry model to find mid-altitude scale
-        background = float(np.median(image))
         step5_matches = _guided_match(
             image, best_model, med_az, med_alt,
             search_radius=12,
-            min_peak=background + 2000,
+            min_peak=background + min_peak_offset,
             background=background,
             alt_min_rad=np.radians(30),
             alt_max_rad=np.radians(70),
@@ -2551,6 +2695,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     m6a, n6a, rms6a = guided_refine(
         image, wide_az, wide_alt, dist_seed,
         n_iterations=15,
+        min_peak_offset=min_peak_offset,
         alt_min_deg=15, alt_max_deg=75,
         fix_az0=near_zenith,
         fit_distortion=True,
@@ -2567,6 +2712,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     m6b, n6b, rms6b = guided_refine(
         image, wide_az, wide_alt, m6a,
         n_iterations=15,
+        min_peak_offset=min_peak_offset,
         alt_min_deg=5, alt_max_deg=88,
         fix_az0=near_zenith,
         fit_distortion=True,
@@ -2583,6 +2729,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     m6c, n6c, rms6c = guided_refine(
         image, wide_az, wide_alt, m6b,
         n_iterations=15,
+        min_peak_offset=min_peak_offset,
         alt_min_deg=3, alt_max_deg=88,
         fix_az0=near_zenith,
         fit_distortion=True,
@@ -2626,15 +2773,42 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         best_n = n6d
         best_rms = rms6d
 
+    # Phase E: Deep guided refinement.
+    # Extend slightly beyond the vmag<5 used in A-C to pick up a few more
+    # real stars, but not so deep that noise matches degrade the fit.
+    deep_mask = vmag_ext < 5.5
+    deep_az = cat_az[deep_mask]
+    deep_alt = cat_alt[deep_mask]
+    m6e, n6e, rms6e = guided_refine(
+        image, deep_az, deep_alt, best_model,
+        n_iterations=15,
+        min_peak_offset=min_peak_offset,
+        alt_min_deg=5, alt_max_deg=88,
+        fix_az0=False,
+        fit_distortion=True,
+        horizon_r=hr, horizon_weight=1.0,
+    )
+    if verbose:
+        r_h = _apply_distortion(
+            _theta_to_r(np.pi / 2, m6e.f, m6e.proj_type), m6e.k1, m6e.k2)
+        log.info(f"  Phase E (full guided): {n6e} matches, RMS={rms6e:.1f}, "
+                 f"f={m6e.f:.0f}, k1={m6e.k1:.2e}, "
+                 f"horizon={r_h:.0f}px")
+
+    # Only adopt Phase E if RMS didn't degrade significantly
+    if n6e > best_n and rms6e <= best_rms * 1.15:
+        best_model = m6e
+        best_n = n6e
+        best_rms = rms6e
+
     # --- Step 7: Residual diagnostics ---
     if verbose:
         log.info("Step 7: Residual diagnostics")
     if best_n >= 6:
-        background = float(np.median(image))
         matches = _guided_match(
             image, best_model, full_az, full_alt,
             search_radius=10,
-            min_peak=background + 2000,
+            min_peak=background + min_peak_offset,
             background=background,
         )
         if len(matches) >= 6:

@@ -1,0 +1,16 @@
+{
+  "filename": "2023_11_19__00_00_11.fits",
+  "source": "haleakala",
+  "global_condition": "clear",
+  "quadrants": {
+    "NE": "clear",
+    "NW": "clear",
+    "SE": "clear",
+    "SW": "obstructed"
+  },
+  "moon_present": false,
+  "moon_phase": null,
+  "bright_planets": ["Jupiter"],
+  "dome_obstruction_pct": 15,
+  "notes": "Dome visible in SW quadrant. Jupiter brightest object, not in catalog."
+}

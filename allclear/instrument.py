@@ -52,7 +52,12 @@ class InstrumentModel:
     frame_used: str = ""
 
     # --- Bookkeeping ---
-    allclear_version: str = "0.2.0"
+    allclear_version: str = ""
+
+    def __post_init__(self):
+        if not self.allclear_version:
+            from allclear import __version__
+            self.allclear_version = __version__
 
     # ---- Conversions ----
 

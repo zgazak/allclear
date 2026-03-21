@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AllClear Benchmark Label",
+  "description": "Human-annotated ground truth for one all-sky camera frame",
+  "type": "object",
+  "required": ["filename", "source", "global_condition", "quadrants"],
+  "properties": {
+    "filename": {
+      "type": "string",
+      "description": "FITS filename (without path)"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["haleakala", "eso_apicam", "liverpool_skycam", "cloudynight"],
+      "description": "Camera/dataset source identifier"
+    },
+    "global_condition": {
+      "type": "string",
+      "enum": ["clear", "thin_cloud", "partial_cloud", "mostly_cloudy", "overcast", "twilight", "unusable"],
+      "description": "Overall sky condition"
+    },
+    "quadrants": {
+      "type": "object",
+      "description": "Per-quadrant sky condition (NE/NW/SE/SW as seen projected on sky)",
+      "properties": {
+        "NE": { "$ref": "#/$defs/quadrant_condition" },
+        "NW": { "$ref": "#/$defs/quadrant_condition" },
+        "SE": { "$ref": "#/$defs/quadrant_condition" },
+        "SW": { "$ref": "#/$defs/quadrant_condition" }
+      },
+      "required": ["NE", "NW", "SE", "SW"]
+    },
+    "moon_present": {
+      "type": "boolean",
+      "description": "Is the moon visible in the frame?"
+    },
+    "moon_phase": {
+      "type": "string",
+      "enum": ["new", "crescent", "quarter", "gibbous", "full"],
+      "description": "Approximate moon phase if present"
+    },
+    "bright_planets": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Bright planets visible (e.g. ['Jupiter', 'Venus'])"
+    },
+    "dome_obstruction_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Approximate percentage of sky blocked by dome/obstructions"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free-form notes (fog, condensation, light leak, etc.)"
+    }
+  },
+  "$defs": {
+    "quadrant_condition": {
+      "type": "string",
+      "enum": ["clear", "thin_cloud", "partial_cloud", "mostly_cloudy", "overcast", "obstructed"]
+    }
+  }
+}

@@ -1,0 +1,10 @@
+# Benchmark FITS data — download via scripts, don't commit
+*.fits
+*.fits.gz
+*.fits.bz2
+*.fits.Z
+manifest.txt
+camera_info.txt
+y_train.dat
+cloudynight_conf.py
+mask.fits
