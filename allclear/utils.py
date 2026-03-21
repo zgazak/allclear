@@ -97,23 +97,28 @@ def extract_obs_time(path):
     return None
 
 
-def parse_fits_header(header):
+def parse_fits_header(header, lat_key="SITELAT", lon_key="SITELONG"):
     """Extract observation metadata from a FITS header.
 
     Returns dict with keys: obs_time, lat_deg, lon_deg, exposure,
-    focal_mm, pixel_um.
+    focal_mm, pixel_um.  lat_deg/lon_deg will be None if the
+    corresponding header key is not found.
     """
     from astropy.time import Time
 
     obs_time_str = header.get("DATE-OBS") or header.get("DATE")
     obs_time = Time(obs_time_str, scale="utc")
 
-    lat_deg = _parse_dms(header["SITELAT"])
-    lon_deg = _parse_dms(header["SITELONG"])
+    raw_lat = header.get(lat_key)
+    raw_lon = header.get(lon_key)
+    lat_deg = _parse_dms(raw_lat) if raw_lat is not None else None
+    lon_deg = _parse_dms(raw_lon) if raw_lon is not None else None
 
-    exposure = float(header.get("EXPOSURE", 1.0))
-    focal_mm = float(header.get("FOCAL", 1.8))
-    pixel_um = float(header.get("XPIXELSZ", 2.4))
+    exposure = float(header.get("EXPOSURE") or header.get("EXPTIME") or 1.0)
+    # XPIXELSZ in microns (SBIG/ZWO convention), PIXSIZE also common
+    pixel_um = float(header.get("XPIXELSZ") or header.get("PIXSIZE") or 2.4)
+    raw_focal = header.get("FOCAL")
+    focal_mm = float(raw_focal) if raw_focal is not None else None
 
     return {
         "obs_time": obs_time,

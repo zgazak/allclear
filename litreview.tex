@@ -1,0 +1,191 @@
+\section{Background and Related Work}
+\label{sec:litreview}
+
+All-sky cameras---typically consisting of a CCD or CMOS sensor behind a
+fisheye lens---provide hemispherical coverage of the sky in a single
+exposure.  They are deployed at observatories for cloud monitoring
+\citep{yoachim_smtn005_2016}, in fireball networks for meteor orbit
+determination \citep{colas_fripon_2020, gardiol_cavezzo_2021}, and
+increasingly for atmospheric characterization at remote sites
+\citep{hanel_measuring_2018}.  Extracting quantitative information from
+these images requires solving three coupled problems: geometric
+calibration of the heavily distorted fisheye projection, identification of
+stars in the presence of instrumental artifacts, and photometric
+measurement of those stars to derive atmospheric transmission.  We review
+the state of the art in each area and identify the gaps that motivate the
+present work.
+
+% ------------------------------------------------------------------
+\subsection{Astrometric Calibration}
+\label{sec:litreview:astrometry}
+
+The foundational projection model for all-sky cameras was introduced by
+\citet{borovicka_astrometry_1995}, who parametrized the fisheye mapping as
+a polynomial in zenith angle with explicit terms for the offset between the
+optical axis and the local zenith.  This model, or variants of it, remains
+the basis of most subsequent work.
+
+\citet{barghini_astrometric_2019} revisited the Borovi\v{c}ka model in the
+context of the PRISMA fireball network, identifying a fundamental source of
+parameter crosstalk: the optical-axis center and the zenith projection lie
+close together on the focal plane, making their separate estimation
+ill-conditioned.  They introduced a ``physical coordinate'' reparametrization
+that decouples these two centers, achieving $\sim$10\,arcsec random
+projection indeterminacy when accumulating statistics over several months of
+data.  The FRIPON network's calibration \citep{jeanne_calibration_2019}
+employs a 9th-degree odd polynomial in radial distance (five free
+coefficients) plus geometry and asymmetry parameters, reaching 2\,arcmin
+absolute and 0.7\,arcmin internal precision.  Both methods require an
+approximate initial geometry---they are refinement procedures, not blind
+solvers.
+
+More recently, \citet{yin_ali_2025} applied HEALPix segmentation of
+all-sky images followed by per-tile solving with Astrometry.net
+\citep{lang_astrometrynet_2010}, then stitched the per-tile solutions into
+a global Generalized WCS model achieving $<$0.25\,pixel accuracy within
+$70^\circ$ zenith angle.  \citet{yang_astrometry_2025} generalized
+narrow-field astrometric techniques to fields exceeding $20^\circ$,
+reaching $\sim$0.4\,pixel accuracy on all-sky images but similarly relying
+on external plate-solving infrastructure.  \citet{tian_astrometric_2022}
+trained a neural network to learn the pixel$\leftrightarrow$sky mapping,
+using particle swarm optimization of the Borovi\v{c}ka model to generate
+training data; the learned model achieves $\sim$1\,arcmin residuals but
+requires a pre-calibrated parametric model as a training seed.
+\citet{antuna-sanchez_orion_2022} developed the ORION calibration tool,
+which fits three parameters (zenith pixel position, azimuth offset, and a
+radial distortion curve) either automatically or with manual star
+identification, achieving $\sim$9\,arcmin ($\sim$1.7\,pixel) accuracy.
+
+A common limitation across these methods is that none provides a
+fully self-contained blind solve for an uncalibrated all-sky camera from a
+single frame.  Astrometry.net's geometric hashing
+\citep{lang_astrometrynet_2010} is designed for approximately linear
+projections; applying it to $180^\circ$ fisheye images requires
+segmentation and per-tile solving \citep{yin_ali_2025}, adding pipeline
+complexity and discarding the geometric constraints inherent in the global
+fisheye projection.
+
+% ------------------------------------------------------------------
+\subsection{Star Detection and Matching}
+\label{sec:litreview:detection}
+
+Standard source detection algorithms (SExtractor, DAOStarFinder) were
+designed for narrow-field astronomical images where the vast majority of
+detected sources are real celestial objects.  In all-sky camera imagery,
+the situation is inverted: dome structures, lens reflections, internal
+baffling features, and horizon obstructions routinely dominate the
+detection list.  \citet{zhi_cloud_2024} used SExtractor for star
+extraction in their cloud reconstruction pipeline, achieving 0.87\,pixel
+whole-sky calibration accuracy, but did not address the artifact
+contamination problem---their camera installation apparently lacked
+significant dome or obstruction features.
+
+The PRISMA pipeline \citep{barghini_astrometric_2019} mitigates this
+by starting from the brightest detected sources (which are more likely to
+be real stars) and iteratively extending to fainter magnitudes as the model
+improves.  This top-down approach helps but still requires a detection
+step, and the brightest ``sources'' in many all-sky installations are in
+fact dome glow or lens reflections.
+
+An alternative paradigm is \emph{forced} or \emph{guided} photometry, in
+which catalog star positions are projected into pixel coordinates using a
+known (or approximate) camera model, and flux is measured at those
+predicted positions without running general source detection.  The
+LSST all-sky camera team explored this approach
+\citep{yoachim_smtn005_2016} but reported that their camera lacked
+sufficient sensitivity to detect enough stars at adequate signal-to-noise
+for full transparency mapping.  \citet{roman_aod_2025} measured flux at
+the positions of 56 pre-selected reference stars across eight all-sky
+cameras deployed at nine sites, demonstrating the viability of forced
+photometry for aerosol optical depth retrieval but limiting spatial
+resolution to $\sim$56 independent measurements per hemisphere.
+
+% ------------------------------------------------------------------
+\subsection{Cloud Detection}
+\label{sec:litreview:clouds}
+
+Cloud detection from all-sky cameras broadly falls into three categories.
+
+\textbf{Threshold and differencing methods} detect clouds by examining
+temporal changes or spatial uniformity.  \citet{yoachim_smtn005_2016}
+differenced consecutive LSST all-sky frames, applied Gaussian smoothing,
+and flagged pixels exceeding $3\sigma$ above the RMS.  This detects
+\emph{changes} in cloud cover but cannot identify static overcast
+conditions or measure cloud opacity.  \citet{buntin_cloud_2025} extended
+this approach with Otsu thresholding on difference images and
+morphological cleanup, achieving $\sim$1\% false positive/negative rates
+on 636\,000 images from the Liverpool Telescope's SkyCam and demonstrating
+cloud tracking and prediction up to 15 minutes ahead.
+
+\textbf{Machine learning classifiers} treat cloud detection as an image
+classification or segmentation problem.  \citet{mommert_cloudynight_2020}
+trained ResNet and LightGBM models on $\sim$2000 manually labeled images
+from the Lowell Discovery Telescope all-sky camera, with LightGBM achieving
+95\% accuracy on extracted features.  \citet{li_classification_2022} used
+random forests on cloud area, weight, and dispersion features, reaching
+96.6\% accuracy.  The LenghuSky-8 dataset \citep{rui_lenghusky_2025}
+provides 429\,000 frames with three-class cloud masks (sky, cloud,
+contamination) and per-pixel alt-az calibration from an 8-year campaign at
+the Lenghu site; a DINOv2 linear probe achieves 93.3\% segmentation
+accuracy.  These methods provide binary or categorical cloud masks but do
+not measure quantitative transmission or opacity.
+
+\textbf{Star photometry methods} use the measured brightness of detected
+stars, compared to catalog values, as a probe of atmospheric transparency.
+\citet{zhi_cloud_2024} developed seven cloud-layer reconstruction methods
+(meshing plus machine learning interpolation) from SExtractor photometry,
+achieving 1.8$^\circ$ reconstruction accuracy.  The CTA all-sky camera
+system counts detected versus expected stars per exposure as a binary cloud
+indicator.  \citet{bortolotto_extinction_2014} and
+\citet{anghel_photometric_2019} used all-sky camera photometry to derive
+extinction coefficients via the Bouguer method, measuring global (not
+spatially resolved) atmospheric properties.
+
+% ------------------------------------------------------------------
+\subsection{Atmospheric Transmission Measurement}
+\label{sec:litreview:transmission}
+
+Quantitative, spatially resolved atmospheric transmission from all-sky
+cameras remains largely an open problem.  The traditional Bouguer--Langley
+technique \citep{bortolotto_extinction_2014, anghel_photometric_2019}
+tracks individual stars across airmasses through a night, deriving a single
+extinction coefficient that assumes a horizontally uniform atmosphere.
+\citet{roman_aod_2025} extended star photometry to aerosol optical depth
+retrieval across a network of all-sky cameras, validating against lunar
+photometers (correlation $>$0.90), but their method produces a bulk AOD per
+camera rather than a spatially resolved map.
+
+\citet{zhi_cloud_2024} produced the most spatially detailed cloud
+reconstruction to date, using SExtractor-detected stars as probes of local
+transmission and interpolating via meshing and machine learning.  However,
+their approach inherits the limitations of source detection (artifact
+contamination) and achieves relatively coarse ($1.8^\circ$) angular
+resolution.  No published method addresses the problem of \emph{unmatched}
+catalog stars---sky regions where no star is detected at all---as
+quantitative zero-transmission anchors in the interpolation.
+
+% ------------------------------------------------------------------
+\subsection{Motivation for This Work}
+\label{sec:litreview:motivation}
+
+The gaps identified above motivate the present system.  First, no existing
+method provides a fully blind, self-contained astrometric solve for an
+uncalibrated all-sky fisheye camera from a single frame---all published
+approaches require either external solving infrastructure, approximate
+initial geometry, or multi-frame accumulation.  Second, source detection in
+all-sky imagery is fundamentally compromised by dome and obstruction
+artifacts, yet most photometric pipelines rely on general-purpose detection
+algorithms without addressing this.  Third, spatially resolved atmospheric
+transmission maps remain rare and coarse, with no method exploiting
+unmatched-star probes or local-background photometry to handle the bright
+foreground contamination common in dome-enclosed cameras.
+
+We present \textsc{AllClear}, an open-source pipeline that addresses these
+three challenges through: (1) a hypothesis-and-verify blind solver that
+determines camera geometry from scratch without external tools; (2)
+detection-free guided matching that projects catalog positions into pixel
+space and searches for point-source peaks, bypassing artifact-dominated
+detection lists; and (3) a transmission measurement system that combines
+local-background-subtracted photometry, absolute calibration via a stored
+photometric zeropoint, and zero-transmission probing at unmatched catalog
+positions to produce continuous all-sky transmission maps.
