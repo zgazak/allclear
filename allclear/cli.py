@@ -652,7 +652,8 @@ def cmd_check(args):
 # ---- manual-fit ----
 
 def cmd_manual_fit(args):
-    from .manual_fit import get_identifiable_objects, ManualFitGUI
+    from .manual_fit import get_identifiable_objects
+    from .manual_fit_web import ManualFitWeb
 
     frames = _resolve_frames(args.frames)
     if not frames:
@@ -683,20 +684,24 @@ def cmd_manual_fit(args):
 
     # Load initial model if provided
     initial_model = None
+    mirrored = False
     if args.model:
         from .instrument import InstrumentModel
         model_path = pathlib.Path(args.model)
         if model_path.exists():
             inst = InstrumentModel.load(model_path)
             initial_model = inst.to_camera_model()
+            mirrored = inst.mirrored
             print(f"  Initial model loaded from {args.model}")
+            if mirrored:
+                print(f"  Model is mirrored (image will be flipped)")
         else:
             print(f"  Warning: model file not found: {args.model}",
                   file=sys.stderr)
 
-    gui = ManualFitGUI(data, objects, cat, meta, args.output,
-                       initial_model=initial_model)
-    gui.run()
+    viewer = ManualFitWeb(data, objects, cat, meta, args.output,
+                          initial_model=initial_model, mirrored=mirrored)
+    viewer.run()
     return 0
 
 

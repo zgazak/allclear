@@ -300,10 +300,13 @@ class ManualFitGUI:
         self.output_path = output_path
         self.initial_model = initial_model
 
-        # Correction tracking: list of (obj_index, actual_px, actual_py)
+        # Correction tracking: list of (az_rad, alt_rad, actual_px, actual_py)
         self.corrections = []
-        self.pending_obj_idx = None  # selected, waiting for click
-        self._pick_consumed = False  # debounce: suppress click after pick
+        self.pending_obj_idx = None   # named object selected
+        self.pending_cat_idx = None   # catalog star selected
+        self._pick_consumed = False   # debounce: suppress click after pick
+        self._cat_px = None           # cached projected catalog positions
+        self._cat_py = None
 
         # Model state
         self.model = initial_model
@@ -328,9 +331,9 @@ class ManualFitGUI:
     def _print_help(self):
         """Print instructions to terminal."""
         print("\n=== Manual Fit Tool ===")
-        print("The image shows predicted positions of identifiable objects")
-        print("(yellow diamonds). Click a label to select it, then click")
-        print("where the object ACTUALLY is in the image.\n")
+        print("Use scroll wheel or toolbar to ZOOM into regions.")
+        print("Click any star marker (red circle, yellow diamond, or green")
+        print("match) to select it, then click where it ACTUALLY is.\n")
         print("Keyboard shortcuts:")
         print("  r  = run guided refine (auto-match hundreds of stars)")
         print("  d  = run guided refine WITH distortion fitting")
@@ -347,11 +350,10 @@ class ManualFitGUI:
         """Create the matplotlib figure and connect events."""
         ny, nx = self.image.shape
         dpi = 100
-        # Cap figure size for very large images
         scale = min(1.0, 1600.0 / max(nx, ny))
         fig = plt.figure(figsize=(nx * scale / dpi, ny * scale / dpi),
                          dpi=dpi)
-        fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.95)
+        fig.subplots_adjust(left=0.02, right=0.98, bottom=0.06, top=0.95)
         ax = fig.add_subplot(111)
 
         vmin, vmax = np.percentile(self.image, [1, 99.5])
@@ -359,6 +361,9 @@ class ManualFitGUI:
                   vmin=vmin, vmax=vmax)
         ax.set_xlim(0, nx - 1)
         ax.set_ylim(0, ny - 1)
+
+        # Enable zoom/pan toolbar (matplotlib's built-in)
+        fig.canvas.toolbar_visible = True
 
         self.fig = fig
         self.ax = ax
@@ -370,9 +375,10 @@ class ManualFitGUI:
         )
         self._prompt_text = ax.text(
             0.5, 0.02,
-            "Click a yellow label to select, then click actual position",
+            "Zoom with scroll/toolbar. Click any star marker to select, "
+            "then click actual position.",
             transform=ax.transAxes,
-            color="yellow", fontsize=11, va="bottom", ha="center",
+            color="yellow", fontsize=10, va="bottom", ha="center",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="black",
                       alpha=0.8, edgecolor="yellow"),
         )
@@ -426,23 +432,38 @@ class ManualFitGUI:
             self._obj_artists.extend([marker, txt])
 
     def _on_pick(self, event):
-        """Handle clicking on a predicted object label."""
+        """Handle clicking on a predicted object label or catalog star."""
         artist = event.artist
-        idx = getattr(artist, '_obj_idx', None)
-        if idx is None:
+        self._pick_consumed = True
+
+        # Named object (yellow diamond/label)?
+        obj_idx = getattr(artist, '_obj_idx', None)
+        if obj_idx is not None:
+            obj = self.objects[obj_idx]
+            self.pending_obj_idx = obj_idx
+            self.pending_cat_idx = None
+            self._prompt_text.set_text(
+                f"Now click where {obj['name']} actually is")
+            self._prompt_text.set_color('#00ffff')
+            self.fig.canvas.draw_idle()
+            print(f"  Selected: {obj['name']} — click its actual position")
             return
 
-        # If we already have a pending selection and the user picks a
-        # different object, just switch selection (don't place).
-        obj = self.objects[idx]
-        self.pending_obj_idx = idx
-        # Suppress the button_press_event that fires from the same click
-        self._pick_consumed = True
-        self._prompt_text.set_text(
-            f"Now click where {obj['name']} actually is in the image")
-        self._prompt_text.set_color('#00ffff')
-        self.fig.canvas.draw_idle()
-        print(f"  Selected: {obj['name']} — click its actual position")
+        # Catalog star (red circle)?
+        cat_idx = getattr(artist, '_cat_star_idx', None)
+        if cat_idx is not None:
+            vmag = float(self.cat_table["vmag_extinct"][cat_idx])
+            az_d = float(self.cat_table["az_deg"][cat_idx])
+            alt_d = float(self.cat_table["alt_deg"][cat_idx])
+            self.pending_cat_idx = cat_idx
+            self.pending_obj_idx = None
+            self._prompt_text.set_text(
+                f"Cat star #{cat_idx} (vmag={vmag:.1f}, "
+                f"az={az_d:.0f} alt={alt_d:.0f}) — click actual position")
+            self._prompt_text.set_color('#00ffff')
+            self.fig.canvas.draw_idle()
+            print(f"  Selected: catalog star #{cat_idx} "
+                  f"(vmag={vmag:.1f}) — click its actual position")
 
     def _on_key(self, event):
         """Handle key press events."""
@@ -493,54 +514,66 @@ class ManualFitGUI:
         self.fig.canvas.draw_idle()
 
     def _on_click(self, event):
-        """Handle mouse click — place the actual position of selected object."""
+        """Handle mouse click — place the actual position of selected star."""
         # Suppress the click that accompanied a pick event (same trackpad tap)
         if self._pick_consumed:
             self._pick_consumed = False
             return
         if event.inaxes != self.ax:
             return
-        if self.pending_obj_idx is None:
+        if self.pending_obj_idx is None and self.pending_cat_idx is None:
             return
         if event.button != 1:
             return
+        # Don't consume clicks when zoom/pan tool is active
+        if self.fig.canvas.toolbar and self.fig.canvas.toolbar.mode:
+            return
 
-        px = float(event.xdata)
-        py = float(event.ydata)
-        idx = self.pending_obj_idx
-        obj = self.objects[idx]
+        click_x = float(event.xdata)
+        click_y = float(event.ydata)
 
-        # Remove any existing correction for this object
-        self.corrections = [(i, x, y) for i, x, y in self.corrections
-                            if i != idx]
-        self.corrections.append((idx, px, py))
-        self.pending_obj_idx = None
-
-        # Draw arrow from predicted to actual position
-        if self.model is not None:
+        # Determine the sky position of the selected star
+        if self.pending_obj_idx is not None:
+            obj = self.objects[self.pending_obj_idx]
             az_rad = np.radians(obj["az_deg"])
             alt_rad = np.radians(obj["alt_deg"])
+            star_label = obj["name"]
+            self.pending_obj_idx = None
+        elif self.pending_cat_idx is not None:
+            ci = self.pending_cat_idx
+            az_rad = np.radians(float(self.cat_table["az_deg"][ci]))
+            alt_rad = np.radians(float(self.cat_table["alt_deg"][ci]))
+            vmag = float(self.cat_table["vmag_extinct"][ci])
+            star_label = f"v={vmag:.1f}"
+            self.pending_cat_idx = None
+        else:
+            return
+
+        # Store correction as (az_rad, alt_rad, pixel_x, pixel_y)
+        self.corrections.append((az_rad, alt_rad, click_x, click_y))
+
+        # Draw arrow from predicted to actual
+        if self.model is not None:
             pred_x, pred_y = self.model.sky_to_pixel(
                 np.array([az_rad]), np.array([alt_rad]))
             arrow = self.ax.annotate(
-                '', xy=(px, py), xytext=(float(pred_x[0]), float(pred_y[0])),
+                '', xy=(click_x, click_y),
+                xytext=(float(pred_x[0]), float(pred_y[0])),
                 arrowprops=dict(arrowstyle='->', color='#00ffff', lw=2))
             self._corr_artists.append(arrow)
 
-        # Cyan marker at actual position
-        marker = self.ax.plot(px, py, '+', color='#00ffff',
-                              markersize=15, markeredgewidth=2)[0]
-        label = self.ax.text(px + 12, py - 12, obj["name"],
-                             color='#00ffff', fontsize=8)
+        marker = self.ax.plot(click_x, click_y, '+', color='#00ffff',
+                              markersize=12, markeredgewidth=2)[0]
+        label = self.ax.text(click_x + 8, click_y - 8, star_label,
+                             color='#00ffff', fontsize=7)
         self._corr_artists.extend([marker, label])
 
         self._prompt_text.set_text(
-            "Click a yellow label to select, then click actual position")
+            "Click any star marker to select, then click actual position")
         self._prompt_text.set_color('yellow')
 
-        print(f"  {obj['name']}: actual position ({px:.0f}, {py:.0f})")
+        print(f"  {star_label}: actual ({click_x:.0f}, {click_y:.0f})")
 
-        # Auto-solve if we have 3+ corrections
         if len(self.corrections) >= 3:
             self._auto_solve()
 
@@ -553,8 +586,7 @@ class ManualFitGUI:
             print("  Nothing to undo.")
             return
         removed = self.corrections.pop()
-        obj = self.objects[removed[0]]
-        print(f"  Undone: {obj['name']}")
+        print(f"  Undone last correction")
 
         # Remove last 3 artists (arrow + marker + label)
         for _ in range(3):
@@ -572,12 +604,10 @@ class ManualFitGUI:
 
     def _auto_solve(self):
         """Re-solve model from correction clicks."""
-        click_px = [c[1] for c in self.corrections]
-        click_py = [c[2] for c in self.corrections]
-        click_az = [np.radians(self.objects[c[0]]["az_deg"])
-                    for c in self.corrections]
-        click_alt = [np.radians(self.objects[c[0]]["alt_deg"])
-                     for c in self.corrections]
+        click_az = [c[0] for c in self.corrections]
+        click_alt = [c[1] for c in self.corrections]
+        click_px = [c[2] for c in self.corrections]
+        click_py = [c[3] for c in self.corrections]
 
         try:
             self.model = solve_from_clicks(
@@ -689,7 +719,7 @@ class ManualFitGUI:
                               alpha=0.7, edgecolor="none"))
                 self._grid_artists.append(txt)
 
-        # --- Catalog stars (red circles for bright, predicted positions) ---
+        # --- Catalog stars (red circles, pickable for correction) ---
         if self.cat_table is not None:
             cat_az = np.radians(
                 np.asarray(self.cat_table["az_deg"], dtype=np.float64))
@@ -698,23 +728,27 @@ class ManualFitGUI:
             cat_x, cat_y = model.sky_to_pixel(cat_az, cat_alt)
             vmag = np.asarray(self.cat_table["vmag_extinct"], dtype=np.float64)
 
+            # Store projected positions for click-to-select
+            self._cat_px = cat_x
+            self._cat_py = cat_y
+
             order = np.argsort(vmag)
             n_shown = 0
             for i in order:
-                if n_shown >= 150:
+                if n_shown >= 500:
                     break
                 cx, cy = float(cat_x[i]), float(cat_y[i])
                 if not (np.isfinite(cx) and np.isfinite(cy)
                         and 0 <= cx < nx and 0 <= cy < ny):
                     continue
                 radius = max(3, int(10 - 1.2 * float(vmag[i])))
-                from matplotlib.patches import Circle
-                circle = Circle(
-                    (cx, cy), radius=radius,
-                    facecolor="none", edgecolor="#ff4444",
-                    linewidth=0.8, alpha=0.6)
-                self.ax.add_patch(circle)
-                self._grid_artists.append(circle)
+                # Pickable marker (use plot instead of Circle for easier picking)
+                marker = self.ax.plot(
+                    cx, cy, 'o', color='none', markeredgecolor='#ff4444',
+                    markersize=radius * 2, markeredgewidth=0.8,
+                    alpha=0.6, picker=True, pickradius=max(5, radius))[0]
+                marker._cat_star_idx = int(i)
+                self._grid_artists.append(marker)
                 n_shown += 1
 
     def _plot_segments(self, x, y, nx, **kwargs):
@@ -819,12 +853,10 @@ class ManualFitGUI:
             parts.append(f"RMS={self.guided_rms:.1f}px")
         elif self.model is not None and n_id >= 3:
             # Show click-based RMS
-            click_px = np.array([c[1] for c in self.corrections])
-            click_py = np.array([c[2] for c in self.corrections])
-            click_az = np.array([np.radians(self.objects[c[0]]["az_deg"])
-                                 for c in self.corrections])
-            click_alt = np.array([np.radians(self.objects[c[0]]["alt_deg"])
-                                  for c in self.corrections])
+            click_az = np.array([c[0] for c in self.corrections])
+            click_alt = np.array([c[1] for c in self.corrections])
+            click_px = np.array([c[2] for c in self.corrections])
+            click_py = np.array([c[3] for c in self.corrections])
             mx, my = self.model.sky_to_pixel(click_az, click_alt)
             rms = float(np.sqrt(np.mean(
                 (mx - click_px)**2 + (my - click_py)**2)))
