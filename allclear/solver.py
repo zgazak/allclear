@@ -94,16 +94,16 @@ def fast_solve(image, det_table, cat_table, camera_model,
     in_frame = (np.isfinite(cat_x) & np.isfinite(cat_y)
                 & (cat_x >= 0) & (cat_x < nx)
                 & (cat_y >= 0) & (cat_y < ny)
-                & (vmag < 5.5))
+                & (vmag < 7.0))
     n_expected = int(np.sum(in_frame))
 
     # --- Guided matching against pixel data ---
     background = float(np.median(image))
 
-    # Use stars up to mag 5.5 for guided matching
-    bright_mask = vmag < 5.5
+    # Use deep catalog for guided matching (same depth as instrument-fit)
+    bright_mask = vmag < 7.0
     if np.sum(bright_mask) < 20:
-        bright_mask = vmag < 6.5
+        bright_mask = vmag < 8.0
     bright_idx = np.where(bright_mask)[0]
     bright_az = cat_az[bright_mask]
     bright_alt = cat_alt[bright_mask]

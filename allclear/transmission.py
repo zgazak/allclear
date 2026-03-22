@@ -74,7 +74,7 @@ class TransmissionMap:
 def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
                          image=None, image_shape=None,
                          reference_zeropoint=None,
-                         probe_vmag_limit=5.5, probe_radius=8):
+                         probe_vmag_limit=7.0, probe_radius=8):
     """Compute per-star transmission from matched photometry.
 
     When ``image`` is provided, flux is re-measured using local background
@@ -143,7 +143,9 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
 
         det_flux = np.zeros(len(matched_pairs), dtype=np.float64)
         for k, (di, ci) in enumerate(matched_pairs):
-            # Use MODEL-PREDICTED position, not matched detection position
+            # Forced photometry at MODEL-PREDICTED position.
+            # Use a small aperture (3×3) for the peak to avoid grabbing
+            # a neighboring star, with a wider annulus for background.
             x = float(px_all[ci])
             y = float(py_all[ci])
             xi, yi = int(round(x)), int(round(y))
@@ -156,7 +158,11 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
                 box[0, :], box[-1, :], box[1:-1, 0], box[1:-1, -1]
             ])
             local_bg = float(np.median(edge))
-            peak = float(np.max(box))
+            # Peak from SMALL aperture centered on predicted position
+            # (not the global max of the box, which might be a neighbor)
+            sr = 2  # 5×5 inner aperture
+            inner = box[r - sr:r + sr + 1, r - sr:r + sr + 1]
+            peak = float(np.max(inner))
             det_flux[k] = max(0, peak - local_bg)
     else:
         det_flux = np.array([float(det_table["flux"][di]) for di, ci in matched_pairs])
@@ -222,18 +228,26 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
             zero_az = []
             zero_alt = []
 
+            # Adaptive threshold for probing — use noise-based minimum
+            bg_est = float(np.median(image)) if image is not None else 0
+            noise_est = max(30.0, np.sqrt(abs(bg_est)))
+            probe_threshold = 5.0 * noise_est  # 5-sigma for probing
+
             if image is not None:
                 rr = probe_radius
                 for ci in candidates:
                     xi = int(round(px[ci]))
                     yi = int(round(py[ci]))
                     box = image[yi - rr:yi + rr + 1, xi - rr:xi + rr + 1]
-                    peak = float(np.max(box))
+                    # Use small aperture at predicted position
+                    sr = min(2, rr)
+                    inner = box[rr - sr:rr + sr + 1, rr - sr:rr + sr + 1]
+                    peak = float(np.max(inner))
                     edge = np.concatenate([
                         box[0, :], box[-1, :], box[1:-1, 0], box[1:-1, -1]
                     ])
                     local_bg = float(np.median(edge))
-                    if (peak - local_bg) < 500:
+                    if (peak - local_bg) < probe_threshold:
                         zero_az.append(all_az_deg[ci])
                         zero_alt.append(all_alt_deg[ci])
             else:
