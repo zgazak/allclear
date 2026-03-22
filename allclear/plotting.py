@@ -4,7 +4,8 @@ import warnings
 
 import matplotlib
 
-matplotlib.use("Agg")
+if matplotlib.get_backend().lower() in ('', 'agg'):
+    matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -481,7 +482,7 @@ def _draw_planets(ax, camera_model, obs_time, lat_deg, lon_deg, nx, ny):
         Image dimensions.
     """
     from astropy.coordinates import (
-        EarthLocation, AltAz, get_body,
+        EarthLocation, AltAz, SkyCoord, get_body,
     )
     import astropy.units as u
 
@@ -525,6 +526,56 @@ def _draw_planets(ax, camera_model, obs_time, lat_deg, lon_deg, nx, ny):
         px, py = float(px), float(py)
 
         # Diamond marker
+        r = max(8, int(fs * 1.5))
+        diamond_x = [px, px + r, px, px - r, px]
+        diamond_y = [py + r, py, py - r, py, py + r]
+        ax.plot(diamond_x, diamond_y, color=color, linewidth=1.5, alpha=0.9,
+                path_effects=[withStroke(linewidth=2.5, foreground="black")])
+
+        # Label
+        ax.text(
+            px + r + 2, py,
+            name,
+            color=color,
+            size=fs * 0.9,
+            va="center",
+            ha="left",
+            fontweight="bold",
+            path_effects=[withStroke(linewidth=2, foreground="black")],
+        )
+
+    # --- Magellanic Clouds (fixed equatorial coordinates) ---
+    dso_objects = [
+        ("LMC", 80.894, -69.756, "#ffcc44"),
+        ("SMC", 13.187, -72.828, "#ffcc44"),
+    ]
+
+    for name, ra_deg, dec_deg, color in dso_objects:
+        try:
+            coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                altaz = coord.transform_to(frame)
+        except Exception:
+            continue
+
+        alt_deg_val = altaz.alt.deg
+        az_deg_val = altaz.az.deg
+
+        if alt_deg_val < 0:
+            continue
+
+        az_rad = np.radians(az_deg_val)
+        alt_rad = np.radians(alt_deg_val)
+        px, py = camera_model.sky_to_pixel(az_rad, alt_rad)
+
+        if not (np.isfinite(px) and np.isfinite(py)
+                and 0 <= px < nx and 0 <= py < ny):
+            continue
+
+        px, py = float(px), float(py)
+
+        # Diamond marker (same style as planets)
         r = max(8, int(fs * 1.5))
         diamond_x = [px, px + r, px, px - r, px]
         diamond_y = [py + r, py, py - r, py, py + r]

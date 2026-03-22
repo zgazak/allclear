@@ -108,7 +108,10 @@ def fast_solve(image, det_table, cat_table, camera_model,
     bright_az = cat_az[bright_mask]
     bright_alt = cat_alt[bright_mask]
 
-    min_peak = background + 1500
+    from .strategies import _adaptive_min_peak_offset
+    p999 = float(np.percentile(image, 99.9))
+    min_peak_offset = _adaptive_min_peak_offset(background, p999)
+    min_peak = background + min_peak_offset
 
     matches = _guided_match(image, model, bright_az, bright_alt,
                             search_radius=int(match_radius),
@@ -431,50 +434,5 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
     )
 
 
-def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
-                  background):
-    """Find the bright peak nearest each projected catalog star.
-
-    Returns list of (cat_idx, det_x, det_y, peak_val).
-    """
-    ny, nx = image.shape
-    matches = []
-    px, py = model.sky_to_pixel(cat_az, cat_alt)
-    r = search_radius
-
-    for i in range(len(cat_az)):
-        xi, yi = int(round(px[i])), int(round(py[i]))
-        if xi - r < 0 or xi + r >= nx or yi - r < 0 or yi + r >= ny:
-            continue
-
-        box = image[yi - r:yi + r + 1, xi - r:xi + r + 1]
-        max_val = float(np.max(box))
-        if max_val < min_peak:
-            continue
-
-        # Centroid around the peak pixel
-        box_float = box.astype(np.float64) - background
-        box_float[box_float < 0] = 0
-
-        max_pos = np.unravel_index(np.argmax(box), box.shape)
-        my, mx = max_pos
-        sr = 3
-        sy0 = max(0, my - sr)
-        sy1 = min(box.shape[0], my + sr + 1)
-        sx0 = max(0, mx - sr)
-        sx1 = min(box.shape[1], mx + sr + 1)
-        sub = box_float[sy0:sy1, sx0:sx1]
-
-        yy, xx = np.mgrid[sy0:sy1, sx0:sx1]
-        total = float(np.sum(sub))
-        if total > 0:
-            cy_c = float(np.sum(yy * sub) / total)
-            cx_c = float(np.sum(xx * sub) / total)
-        else:
-            cy_c, cx_c = float(my), float(mx)
-
-        det_x = xi - r + cx_c
-        det_y = yi - r + cy_c
-        matches.append((i, det_x, det_y, max_val))
-
-    return matches
+# Use the same _guided_match from strategies.py (with nearest-peak matching)
+from .strategies import _guided_match

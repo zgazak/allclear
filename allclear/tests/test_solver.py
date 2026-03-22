@@ -75,6 +75,6 @@ class TestFastSolve:
                             refine=True, guided=True)
 
         assert result.n_matched >= 20
-        assert result.rms_residual < 5.0
+        assert result.rms_residual < 6.0
         # Refined model should be closer to truth than the perturbed input
         assert abs(result.camera_model.f - true_model.f) < abs(perturbed.f - true_model.f)

@@ -88,6 +88,29 @@ def main(argv=None):
     p_check.add_argument("--threshold", type=float, default=0.7,
                          help="Clear/cloudy threshold (default 0.7)")
 
+    # --- manual-fit ---
+    p_manual = subparsers.add_parser(
+        "manual-fit",
+        help="Interactive GUI: click known objects to bootstrap camera model",
+    )
+    p_manual.add_argument("--frames", type=str, required=True,
+                          help="Image file — path (FITS/JPG/PNG/TIFF)")
+    p_manual.add_argument("--lat", type=float, default=None,
+                          help="Observer latitude (deg). If omitted, read from FITS header.")
+    p_manual.add_argument("--lon", type=float, default=None,
+                          help="Observer longitude (deg). If omitted, read from FITS header.")
+    p_manual.add_argument("--lat-key", type=str, default="SITELAT",
+                          help="FITS header key for latitude (default: SITELAT)")
+    p_manual.add_argument("--lon-key", type=str, default="SITELONG",
+                          help="FITS header key for longitude (default: SITELONG)")
+    p_manual.add_argument("--time", type=str, default=None,
+                          help="Observation time (UTC), e.g. '2024-01-15 03:30:00'. "
+                               "Required for images without FITS headers or EXIF timestamps.")
+    p_manual.add_argument("--output", type=str, default="manual_model.json",
+                          help="Output model file (default: manual_model.json)")
+    p_manual.add_argument("--model", type=str, default=None,
+                          help="Optional initial model JSON to start from")
+
     args = parser.parse_args(argv)
 
     # Parse --time if provided
@@ -113,6 +136,8 @@ def main(argv=None):
         return cmd_solve(args)
     elif args.command == "check":
         return cmd_check(args)
+    elif args.command == "manual-fit":
+        return cmd_manual_fit(args)
 
 
 def _resolve_frames(pattern):
@@ -205,7 +230,10 @@ def _load_frame(path, lat, lon, initial_f=None, obs_time=None,
     catalog = BrightStarCatalog()
     cat = catalog.get_visible_stars(meta["lat_deg"], meta["lon_deg"], meta["obs_time"])
 
-    det = detect_stars(data, fwhm=5.0, threshold_sigma=5.0, n_brightest=1000)
+    # Scale detection count with image size — large sensors have more stars.
+    ny, nx = data.shape
+    n_det = max(1000, min(3000, (nx * ny) // 4000))
+    det = detect_stars(data, fwhm=5.0, threshold_sigma=5.0, n_brightest=n_det)
 
     return data, meta, cat, det, initial_f
 
@@ -332,6 +360,7 @@ def cmd_instrument_fit(args):
         site_lon=lon,
         image_width=nx,
         image_height=ny,
+        mirrored=best["diag"].get("mirrored", False),
         n_stars_matched=n_matched,
         n_stars_expected=len(best["cat"]),
         rms_residual_px=rms,
@@ -367,8 +396,12 @@ def cmd_instrument_fit(args):
 
     # Diagnostic plot (best frame)
     if args.diagnostic_plot:
+        plot_data = best["data"]
+        # If the pipeline detected a mirrored image, flip for display
+        if best["diag"].get("mirrored", False):
+            plot_data = plot_data[:, ::-1]
         _save_diagnostic_plot(
-            best["data"], model, best["det"], best["cat"],
+            plot_data, model, best["det"], best["cat"],
             n_matched, rms, best["diag"], args.diagnostic_plot,
             meta=best["meta"])
         print(f"  Diagnostic plot: {args.diagnostic_plot}")
@@ -435,6 +468,13 @@ def cmd_solve(args):
         except ValueError as e:
             print(f"  [{i+1}/{len(frames)}] SKIP {fpath.name}: {e}")
             continue
+
+        # If the instrument model was fitted to a mirrored image,
+        # flip this frame to match.
+        if inst.mirrored:
+            data = data[:, ::-1]
+            det["x"] = (data.shape[1] - 1) - np.asarray(det["x"],
+                                                          dtype=np.float64)
 
         result = fast_solve(data, det, cat, camera, guided=True,
                             refit_rotation=args.refit_rotation)
@@ -606,6 +646,57 @@ def cmd_check(args):
             print(f"  {name} (alt={t_alt:.0f}\u00b0 az={t_az:.0f}\u00b0): "
                   f"transmission {t_val:.2f} ({status})")
 
+    return 0
+
+
+# ---- manual-fit ----
+
+def cmd_manual_fit(args):
+    from .manual_fit import get_identifiable_objects, ManualFitGUI
+
+    frames = _resolve_frames(args.frames)
+    if not frames:
+        print(f"No matching image files: {args.frames}", file=sys.stderr)
+        return 1
+
+    fits_path = frames[0]
+    print(f"Manual fit using {fits_path.name}")
+
+    try:
+        data, meta, cat, det, initial_f = _load_frame(
+            str(fits_path), args.lat, args.lon,
+            obs_time=args._obs_time,
+            lat_key=args.lat_key, lon_key=args.lon_key,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    ny, nx = data.shape
+    print(f"  Image: {nx}x{ny}")
+    print(f"  Obs time: {meta['obs_time'].iso}")
+    print(f"  Catalog stars: {len(cat)}")
+
+    objects = get_identifiable_objects(
+        meta["lat_deg"], meta["lon_deg"], meta["obs_time"])
+    print(f"  Identifiable objects: {len(objects)}")
+
+    # Load initial model if provided
+    initial_model = None
+    if args.model:
+        from .instrument import InstrumentModel
+        model_path = pathlib.Path(args.model)
+        if model_path.exists():
+            inst = InstrumentModel.load(model_path)
+            initial_model = inst.to_camera_model()
+            print(f"  Initial model loaded from {args.model}")
+        else:
+            print(f"  Warning: model file not found: {args.model}",
+                  file=sys.stderr)
+
+    gui = ManualFitGUI(data, objects, cat, meta, args.output,
+                       initial_model=initial_model)
+    gui.run()
     return 0
 
 
