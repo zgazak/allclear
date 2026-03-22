@@ -89,34 +89,38 @@ def fast_solve(image, det_table, cat_table, camera_model,
         k1=camera_model.k1, k2=camera_model.k2,
     )
 
-    # Count expected in-frame stars (brighter than mag 5)
+    # Count expected in-frame stars
     cat_x, cat_y = model.sky_to_pixel(cat_az, cat_alt)
     in_frame = (np.isfinite(cat_x) & np.isfinite(cat_y)
                 & (cat_x >= 0) & (cat_x < nx)
                 & (cat_y >= 0) & (cat_y < ny)
-                & (vmag < 5.0))
+                & (vmag < 5.5))
     n_expected = int(np.sum(in_frame))
 
     # --- Guided matching against pixel data ---
     background = float(np.median(image))
 
-    # Use stars up to mag 5 for guided matching (fall back to 6 if few)
-    bright_mask = vmag < 5.0
+    # Use stars up to mag 5.5 for guided matching
+    bright_mask = vmag < 5.5
     if np.sum(bright_mask) < 20:
-        bright_mask = vmag < 6.0
+        bright_mask = vmag < 6.5
     bright_idx = np.where(bright_mask)[0]
     bright_az = cat_az[bright_mask]
     bright_alt = cat_alt[bright_mask]
 
-    from .strategies import _adaptive_min_peak_offset
-    p999 = float(np.percentile(image, 99.9))
-    min_peak_offset = _adaptive_min_peak_offset(background, p999)
-    min_peak = background + min_peak_offset
+    # For solve mode with a known model, we can use a much lower
+    # detection threshold than instrument-fit (which uses 15-sigma).
+    # With tight search radius and known geometry, false matches from
+    # noise are rare.  3-sigma detects most visible stars.
+    noise_est = max(30.0, np.sqrt(abs(background)))
+    min_peak = background + 3.0 * noise_est
 
     matches = _guided_match(image, model, bright_az, bright_alt,
                             search_radius=int(match_radius),
                             min_peak=min_peak,
                             background=background)
+    original_model = model
+    original_n = len(matches)
 
     # --- Rotation recovery ---
     if refit_rotation:
@@ -131,53 +135,88 @@ def fast_solve(image, det_table, cat_table, camera_model,
                 proj_type=model.proj_type,
                 k1=model.k1, k2=model.k2,
             )
-            # After rotation correction, iteratively refine all pointing
-            # parameters.  Use progressively tighter search radii so
-            # each pass builds on real matches, not accidental ones.
             for iteration, sr in enumerate([
-                int(match_radius),       # first pass: standard radius
-                max(5, int(match_radius * 0.7)),  # tighter
-                max(4, int(match_radius * 0.5)),  # tightest
+                int(match_radius),
+                max(5, int(match_radius * 0.7)),
             ]):
-                matches = _guided_match(
+                rot_matches = _guided_match(
                     image, model, bright_az, bright_alt,
                     search_radius=sr,
                     min_peak=min_peak, background=background,
                 )
-                if len(matches) < _MIN_MATCHES_REFINE:
+                if len(rot_matches) < _MIN_MATCHES_REFINE:
                     break
-                det_x_r = np.array([m[1] for m in matches])
-                det_y_r = np.array([m[2] for m in matches])
-                cat_az_r = np.array([bright_az[m[0]] for m in matches])
-                cat_alt_r = np.array([bright_alt[m[0]] for m in matches])
-                # Wide bounds on first pass (camera may have been
-                # remounted — cx/cy and f could have shifted), then
-                # tighten on subsequent passes.
-                model = _refine_pointing(
-                    model, det_x_r, det_y_r, cat_az_r, cat_alt_r,
-                    wide=(iteration == 0),
-                )
+                det_x_r = np.array([m[1] for m in rot_matches])
+                det_y_r = np.array([m[2] for m in rot_matches])
+                cat_az_r = np.array([bright_az[m[0]] for m in rot_matches])
+                cat_alt_r = np.array([bright_alt[m[0]] for m in rot_matches])
+                # Sigma-clip before refining
+                px_pre, py_pre = model.sky_to_pixel(cat_az_r, cat_alt_r)
+                resid = np.sqrt((px_pre - det_x_r)**2 +
+                                (py_pre - det_y_r)**2)
+                good = resid < max(10.0, np.median(resid) + 2.5 * np.std(resid))
+                if np.sum(good) >= _MIN_MATCHES_REFINE:
+                    model = _refine_pointing(
+                        model, det_x_r[good], det_y_r[good],
+                        cat_az_r[good], cat_alt_r[good],
+                        wide=(iteration == 0),
+                    )
 
-            log.info("After rotation recovery (Δρ=%.1f°): %d matches",
-                     np.degrees(delta_rho), len(matches))
-            # Skip main refine — rotation recovery already refined
-            refine = False
+            # Check: did rotation recovery actually improve things?
+            rot_final = _guided_match(
+                image, model, bright_az, bright_alt,
+                search_radius=int(match_radius),
+                min_peak=min_peak, background=background,
+            )
+            if len(rot_final) > original_n:
+                matches = rot_final
+                log.info("Rotation recovery (Δρ=%.1f°): %d→%d matches",
+                         np.degrees(delta_rho), original_n, len(rot_final))
+                refine = False  # already refined
+            else:
+                # Rotation recovery made things worse — revert
+                model = original_model
+                log.info("Rotation recovery reverted (no improvement)")
 
-    # Refine pointing with initial matches
+    # Refine pointing with initial matches — ONLY if it improves
     if refine and len(matches) >= _MIN_MATCHES_REFINE:
         det_x_m = np.array([m[1] for m in matches])
         det_y_m = np.array([m[2] for m in matches])
         cat_az_m = np.array([bright_az[m[0]] for m in matches])
         cat_alt_m = np.array([bright_alt[m[0]] for m in matches])
 
-        model = _refine_pointing(model, det_x_m, det_y_m,
-                                 cat_az_m, cat_alt_m)
+        # Sigma-clip before refining
+        px_pre, py_pre = model.sky_to_pixel(cat_az_m, cat_alt_m)
+        resid = np.sqrt((px_pre - det_x_m)**2 + (py_pre - det_y_m)**2)
+        good = resid < max(8.0, np.median(resid) + 2.5 * np.std(resid))
+        if np.sum(good) >= _MIN_MATCHES_REFINE:
+            refined = _refine_pointing(
+                model, det_x_m[good], det_y_m[good],
+                cat_az_m[good], cat_alt_m[good])
 
-        # Re-match with refined model at tighter radius
-        matches = _guided_match(image, model, bright_az, bright_alt,
-                                search_radius=max(5, int(match_radius * 0.7)),
-                                min_peak=min_peak,
-                                background=background)
+            # Check: did refine improve things?
+            refined_matches = _guided_match(
+                image, refined, bright_az, bright_alt,
+                search_radius=int(match_radius),
+                min_peak=min_peak, background=background)
+
+            if len(refined_matches) >= len(matches):
+                model = refined
+                matches = refined_matches
+
+    # Final tight re-match: use a small search radius (5px) to produce
+    # clean matches.  In dense star fields, the wider initial radius
+    # picks up wrong neighboring stars; the tight radius ensures each
+    # match is the correct star within ~5px of prediction.
+    final_r = max(3, min(4, int(match_radius)))
+    final_matches = _guided_match(image, model, bright_az, bright_alt,
+                                  search_radius=final_r,
+                                  min_peak=min_peak,
+                                  background=background)
+    if len(final_matches) >= len(matches) * 0.3:
+        # Use tight matches if we retained at least 30% (the rest were
+        # wrong stars that the tight radius correctly excluded)
+        matches = final_matches
 
     # Build matched pairs (det_idx, cat_idx) using catalog indices
     # and a synthetic detection table from guided-match centroids
