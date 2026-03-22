@@ -128,14 +128,24 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
     cat_az = np.array([float(cat_table["az_deg"][ci]) for di, ci in matched_pairs])
     cat_alt = np.array([float(cat_table["alt_deg"][ci]) for di, ci in matched_pairs])
 
-    # Measure flux: prefer local-background subtraction when image available
+    # Measure flux using forced photometry at model-predicted positions.
+    # This avoids measuring flux at wrong-star positions in dense fields.
     if image is not None:
         r = probe_radius
         ny, nx = image.shape
+
+        # Get predicted positions for each matched catalog star
+        all_az_rad = np.radians(
+            np.asarray(cat_table["az_deg"], dtype=np.float64))
+        all_alt_rad = np.radians(
+            np.asarray(cat_table["alt_deg"], dtype=np.float64))
+        px_all, py_all = camera_model.sky_to_pixel(all_az_rad, all_alt_rad)
+
         det_flux = np.zeros(len(matched_pairs), dtype=np.float64)
         for k, (di, ci) in enumerate(matched_pairs):
-            x = float(det_table["x"][di])
-            y = float(det_table["y"][di])
+            # Use MODEL-PREDICTED position, not matched detection position
+            x = float(px_all[ci])
+            y = float(py_all[ci])
             xi, yi = int(round(x)), int(round(y))
             if xi < r or xi >= nx - r or yi < r or yi >= ny - r:
                 det_flux[k] = max(0, float(det_table["flux"][di]))

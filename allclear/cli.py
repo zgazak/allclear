@@ -344,8 +344,8 @@ def cmd_instrument_fit(args):
     n_matched = best["n_matched"]
     rms = best["rms"]
 
-    # ---- Select best zeropoint (most negative = clearest sky) ----
-    best_zp_result = min(results, key=lambda r: r["zeropoint"])
+    # ---- Select best zeropoint (largest = clearest sky) ----
+    best_zp_result = max(results, key=lambda r: r["zeropoint"])
     best_zp = best_zp_result["zeropoint"]
 
     lat = best["meta"]["lat_deg"]

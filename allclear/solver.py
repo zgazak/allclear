@@ -204,19 +204,17 @@ def fast_solve(image, det_table, cat_table, camera_model,
                 model = refined
                 matches = refined_matches
 
-    # Final tight re-match: use a small search radius (5px) to produce
-    # clean matches.  In dense star fields, the wider initial radius
-    # picks up wrong neighboring stars; the tight radius ensures each
-    # match is the correct star within ~5px of prediction.
-    final_r = max(3, min(4, int(match_radius)))
-    final_matches = _guided_match(image, model, bright_az, bright_alt,
-                                  search_radius=final_r,
-                                  min_peak=min_peak,
-                                  background=background)
-    if len(final_matches) >= len(matches) * 0.3:
-        # Use tight matches if we retained at least 30% (the rest were
-        # wrong stars that the tight radius correctly excluded)
-        matches = final_matches
+    # Final neighborhood-verified match: confirm each match by checking
+    # that its catalog neighbors also have detectable peaks.  This rejects
+    # wrong-star matches in dense fields (Milky Way).
+    verified = _neighborhood_verified_match(
+        image, model, bright_az, bright_alt, vmag[bright_mask],
+        search_radius=max(3, min(5, int(match_radius))),
+        min_peak=min_peak, background=background,
+        n_neighbors=3, confirm_radius=5, min_confirmed=2,
+    )
+    if len(verified) >= 10:
+        matches = verified
 
     # Build matched pairs (det_idx, cat_idx) using catalog indices
     # and a synthetic detection table from guided-match centroids
@@ -475,3 +473,100 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
 
 # Use the same _guided_match from strategies.py (with nearest-peak matching)
 from .strategies import _guided_match
+
+
+def _neighborhood_verified_match(image, model, cat_az, cat_alt, cat_vmag,
+                                  search_radius, min_peak, background,
+                                  n_neighbors=3, confirm_radius=5,
+                                  min_confirmed=2, max_offset_spread=4.0):
+    """Guided matching with neighborhood offset-consistency verification.
+
+    For each candidate match, also guided-match its nearest catalog
+    neighbors.  If the offsets (predicted→detected) are consistent
+    across the group (i.e., the pattern shifted as a unit), the match
+    is confirmed.  If the offsets are random, it's a wrong-star match
+    in a dense field.
+
+    Parameters
+    ----------
+    max_offset_spread : float
+        Maximum spread (std) of neighbor offsets to accept as consistent.
+    """
+    ny, nx = image.shape
+
+    # Project all catalog stars and do guided match
+    px_all, py_all = model.sky_to_pixel(cat_az, cat_alt)
+
+    matches = _guided_match(image, model, cat_az, cat_alt,
+                            search_radius, min_peak, background)
+    if len(matches) < 10:
+        return matches
+
+    # Build lookup: cat_idx → match result for fast neighbor checking
+    match_by_cat = {}
+    for cat_idx, det_x, det_y, peak_val in matches:
+        match_by_cat[cat_idx] = (det_x, det_y, peak_val)
+
+    # Build KDTree of predicted positions for neighbor lookup
+    from scipy.spatial import KDTree
+    valid = (np.isfinite(px_all) & np.isfinite(py_all) &
+             (px_all >= 10) & (px_all < nx - 10) &
+             (py_all >= 10) & (py_all < ny - 10))
+    valid_idx = np.where(valid)[0]
+    if len(valid_idx) < n_neighbors + 1:
+        return matches
+    cat_tree = KDTree(np.column_stack([px_all[valid_idx],
+                                        py_all[valid_idx]]))
+
+    verified = []
+    for cat_idx, det_x, det_y, peak_val in matches:
+        pred_x = float(px_all[cat_idx])
+        pred_y = float(py_all[cat_idx])
+        my_dx = det_x - pred_x
+        my_dy = det_y - pred_y
+
+        if not valid[cat_idx]:
+            continue
+
+        # Find nearest catalog neighbors
+        dists_nn, idx_nn = cat_tree.query(
+            [pred_x, pred_y],
+            k=min(n_neighbors + 1, len(valid_idx)))
+        if np.isscalar(idx_nn):
+            idx_nn = np.array([idx_nn])
+            dists_nn = np.array([dists_nn])
+
+        # Check if neighbors have consistent offsets
+        neighbor_offsets_dx = []
+        neighbor_offsets_dy = []
+        for nn_tree_idx, nn_dist in zip(idx_nn, dists_nn):
+            if nn_dist < 1.0:   # skip self
+                continue
+            if nn_dist > 200:   # too far
+                continue
+            nn_cat_idx = int(valid_idx[nn_tree_idx])
+
+            if nn_cat_idx in match_by_cat:
+                nn_det_x, nn_det_y, _ = match_by_cat[nn_cat_idx]
+                nn_pred_x = float(px_all[nn_cat_idx])
+                nn_pred_y = float(py_all[nn_cat_idx])
+                neighbor_offsets_dx.append(nn_det_x - nn_pred_x)
+                neighbor_offsets_dy.append(nn_det_y - nn_pred_y)
+
+        if len(neighbor_offsets_dx) < min_confirmed:
+            # Not enough neighbors matched — can't verify.
+            # Keep the match if it's a tight one (likely correct).
+            if abs(my_dx) < 2.0 and abs(my_dy) < 2.0:
+                verified.append((cat_idx, det_x, det_y, peak_val))
+            continue
+
+        # Check offset consistency: the center star and its neighbors
+        # should all have similar (dx, dy) offsets if correctly matched.
+        all_dx = np.array([my_dx] + neighbor_offsets_dx)
+        all_dy = np.array([my_dy] + neighbor_offsets_dy)
+        spread = np.sqrt(np.std(all_dx)**2 + np.std(all_dy)**2)
+
+        if spread < max_offset_spread:
+            verified.append((cat_idx, det_x, det_y, peak_val))
+
+    return verified
