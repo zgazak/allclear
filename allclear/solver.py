@@ -405,49 +405,55 @@ def _find_rotation_offset(image, model, cat_az, cat_alt, background,
 
 
 def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
-    """Refine pointing offsets (Δaz, Δalt, Δρ, Δf).
+    """Refine pointing offsets.
+
+    Fits (cx, cy, alt0, combined_rotation, f) with az0 fixed to break
+    the near-zenith az0/rho degeneracy.  The combined rotation
+    (az0 + rho) is what matters physically; splitting between az0 and
+    rho is arbitrary for near-zenith cameras.
 
     Parameters
     ----------
     wide : bool
-        If True, use wider bounds suitable for post-rotation-scan
-        refinement (±15° az/alt, ±20° rho).  If False (default),
-        use tight bounds for fixed-mount drift correction.
+        If True, use wider bounds (camera may have been moved/adjusted).
     """
     proj_type = model.proj_type
+    fixed_az0 = model.az0
 
+    # Parameterize as (cx, cy, alt0, rho, f) with az0 fixed
     p0 = np.array([
-        model.cx, model.cy, model.az0, model.alt0,
-        model.rho, model.f,
+        model.cx, model.cy, model.alt0, model.rho, model.f,
     ])
 
     if wide:
         bounds_lo = [
             p0[0] - 50, p0[1] - 50,
-            p0[2] - np.radians(15), p0[3] - np.radians(15),
-            p0[4] - np.radians(20), p0[5] * 0.95,
+            p0[2] - np.radians(10),
+            p0[3] - np.radians(10), p0[4] * 0.95,
         ]
         bounds_hi = [
             p0[0] + 50, p0[1] + 50,
-            p0[2] + np.radians(15), p0[3] + np.radians(15),
-            p0[4] + np.radians(20), p0[5] * 1.05,
+            p0[2] + np.radians(10),
+            p0[3] + np.radians(10), p0[4] * 1.05,
         ]
     else:
+        # Allow enough room for seasonal thermal drift:
+        # cx/cy: ±15px, alt0: ±5° (tilt), rho: ±5° (rotation), f: ±1%
         bounds_lo = [
-            p0[0] - 20, p0[1] - 20,
-            p0[2] - np.radians(3), p0[3] - np.radians(3),
-            p0[4] - np.radians(2), p0[5] * 0.98,
+            p0[0] - 15, p0[1] - 15,
+            p0[2] - np.radians(5),
+            p0[3] - np.radians(5), p0[4] * 0.99,
         ]
         bounds_hi = [
-            p0[0] + 20, p0[1] + 20,
-            p0[2] + np.radians(3), p0[3] + np.radians(3),
-            p0[4] + np.radians(2), p0[5] * 1.02,
+            p0[0] + 15, p0[1] + 15,
+            p0[2] + np.radians(5),
+            p0[3] + np.radians(5), p0[4] * 1.01,
         ]
 
     def residuals(params):
         m = CameraModel(
-            cx=params[0], cy=params[1], az0=params[2],
-            alt0=params[3], rho=params[4], f=params[5],
+            cx=params[0], cy=params[1], az0=fixed_az0,
+            alt0=params[2], rho=params[3], f=params[4],
             proj_type=proj_type,
             k1=model.k1, k2=model.k2,
         )
@@ -464,8 +470,8 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
 
     params = result.x
     return CameraModel(
-        cx=params[0], cy=params[1], az0=params[2],
-        alt0=params[3], rho=params[4], f=params[5],
+        cx=params[0], cy=params[1], az0=fixed_az0,
+        alt0=params[2], rho=params[3], f=params[4],
         proj_type=proj_type,
         k1=model.k1, k2=model.k2,
     )
