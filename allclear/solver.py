@@ -178,6 +178,47 @@ def fast_solve(image, det_table, cat_table, camera_model,
                 model = original_model
                 log.info("Rotation recovery reverted (no improvement)")
 
+    # Local offset measurement: find the per-tile (dx, dy) offset between
+    # model predictions and actual detection positions.  This robustly
+    # measures pointing drift even in dense star fields where individual
+    # guided matches fail.
+    if refine and det_table is not None and len(det_table) > 50:
+        from .local_offset import measure_local_offsets, fit_pointing_from_offsets
+        from .detection import detect_stars
+
+        img_for_offset = image
+        det_for_offset = det_table
+        offset_det_x = np.asarray(det_for_offset["x"], dtype=np.float64)
+        offset_det_y = np.asarray(det_for_offset["y"], dtype=np.float64)
+
+        tile_sz = max(200, min(500, min(ny, nx) // 6))
+        local_offsets = measure_local_offsets(
+            image, model, cat_az, cat_alt, vmag,
+            offset_det_x, offset_det_y,
+            tile_size=tile_sz, search_radius=15,
+            search_step=1, min_matches=3,
+            match_radius=4.0, vmag_limit=7.0,
+        )
+
+        if len(local_offsets) >= 3:
+            corrected, summary = fit_pointing_from_offsets(
+                model, local_offsets, image.shape)
+
+            # Check: did the correction improve matches?
+            corrected_matches = _guided_match(
+                image, corrected, bright_az, bright_alt,
+                search_radius=int(match_radius),
+                min_peak=min_peak, background=background)
+
+            if len(corrected_matches) > len(matches):
+                model = corrected
+                matches = corrected_matches
+                log.info("Local offset correction: %d tiles, "
+                         "dx=%.1f dy=%.1f, %d→%d matches",
+                         summary["n_tiles"],
+                         summary["median_dx"], summary["median_dy"],
+                         original_n, len(corrected_matches))
+
     # Refine pointing with initial matches — ONLY if it improves
     if refine and len(matches) >= _MIN_MATCHES_REFINE:
         det_x_m = np.array([m[1] for m in matches])
