@@ -193,9 +193,21 @@ class ManualFitWeb:
                     "category": obj["category"],
                 })
 
-        # Include current corrections
-        for c in self.corrections:
-            result["corrections"].append(c)
+        # Include current corrections with UPDATED predicted positions
+        # from the current model (so arrows track model changes).
+        if self.model is not None:
+            for c in self.corrections:
+                az_r = np.radians(c["az_deg"])
+                alt_r = np.radians(c["alt_deg"])
+                px_c, py_c = self.model.sky_to_pixel(
+                    np.array([az_r]), np.array([alt_r]))
+                cc = dict(c)
+                cc["pred_x"] = float(px_c[0])
+                cc["pred_y"] = float(py_c[0])
+                result["corrections"].append(cc)
+        else:
+            for c in self.corrections:
+                result["corrections"].append(c)
 
         return result
 
@@ -231,14 +243,38 @@ class ManualFitWeb:
                 (mx - np.array(click_px))**2 +
                 (my - np.array(click_py))**2)))
             print(f"  Solved: f={self.model.f:.1f}, "
-                  f"rho={np.degrees(self.model.rho):.1f} deg, "
+                  f"cx={self.model.cx:.0f}, cy={self.model.cy:.0f}, "
+                  f"alt0={np.degrees(self.model.alt0):.1f}°, "
+                  f"rho={np.degrees(self.model.rho):.1f}°, "
                   f"RMS={rms:.1f} px")
+
+            # Auto-refine with distortion when we have enough corrections
+            # spread across the sky (coverage check)
+            n = len(self.corrections)
+            if n >= 8 and self._has_sky_coverage():
+                print(f"  Auto-refining with distortion "
+                      f"({n} corrections with sky coverage)...")
+                result = self._handle_refine({"fit_distortion": True})
+                if result.get("status") == "refined":
+                    rms = result.get("rms", rms)
 
             stars = self._get_stars_json()
             return {"status": "solved", "rms": rms, "stars": stars}
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"  Solve failed: {e}")
             return {"status": "error", "message": str(e)}
+
+    def _has_sky_coverage(self):
+        """Check if corrections span at least 3 quadrants of the sky."""
+        if len(self.corrections) < 6:
+            return False
+        azimuths = [c["az_deg"] for c in self.corrections]
+        quadrants = set()
+        for az in azimuths:
+            quadrants.add(int(az / 90) % 4)
+        return len(quadrants) >= 3
 
     def _handle_refine(self, data):
         """Run guided_refine."""
