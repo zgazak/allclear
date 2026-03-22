@@ -72,7 +72,7 @@ class TestFastSolve:
         )
 
         result = fast_solve(image, det, cat, perturbed,
-                            refine=True, guided=True)
+                            match_radius=15.0, refine=True, guided=True)
 
         assert result.n_matched >= 20
         assert result.rms_residual < 6.0
