@@ -191,33 +191,38 @@ def fast_solve(image, det_table, cat_table, camera_model,
         offset_det_x = np.asarray(det_for_offset["x"], dtype=np.float64)
         offset_det_y = np.asarray(det_for_offset["y"], dtype=np.float64)
 
+        # Iterate: measure offsets, correct, repeat.  Each iteration
+        # refines the pointing as the model gets closer to the truth.
         tile_sz = max(200, min(500, min(ny, nx) // 6))
-        local_offsets = measure_local_offsets(
-            image, model, cat_az, cat_alt, vmag,
-            offset_det_x, offset_det_y,
-            tile_size=tile_sz, search_radius=15,
-            search_step=1, min_matches=3,
-            match_radius=4.0, vmag_limit=7.0,
-        )
+        current = model
+        for lo_iter in range(3):
+            sr = 50 if lo_iter == 0 else 30  # wider search first time
+            step = 3 if lo_iter == 0 else 2
+            local_offsets = measure_local_offsets(
+                image, current, cat_az, cat_alt, vmag,
+                offset_det_x, offset_det_y,
+                tile_size=tile_sz, search_radius=sr,
+                search_step=step, min_matches=5,
+                match_radius=5.0, vmag_limit=7.0,
+            )
+            good = [o for o in local_offsets
+                    if o["n_matches"] > o["n_cat"] * 0.25]
+            if len(good) < 5:
+                break
+            current, summary = fit_pointing_from_offsets(
+                current, good, image.shape)
 
-        if len(local_offsets) >= 3:
-            corrected, summary = fit_pointing_from_offsets(
-                model, local_offsets, image.shape)
+        # Check: did the correction improve matches?
+        corrected_matches = _guided_match(
+            image, current, bright_az, bright_alt,
+            search_radius=int(match_radius),
+            min_peak=min_peak, background=background)
 
-            # Check: did the correction improve matches?
-            corrected_matches = _guided_match(
-                image, corrected, bright_az, bright_alt,
-                search_radius=int(match_radius),
-                min_peak=min_peak, background=background)
-
-            if len(corrected_matches) > len(matches):
-                model = corrected
-                matches = corrected_matches
-                log.info("Local offset correction: %d tiles, "
-                         "dx=%.1f dy=%.1f, %d→%d matches",
-                         summary["n_tiles"],
-                         summary["median_dx"], summary["median_dy"],
-                         original_n, len(corrected_matches))
+        if len(corrected_matches) > len(matches):
+            model = current
+            matches = corrected_matches
+            log.info("Local offset correction: %d→%d matches",
+                     original_n, len(corrected_matches))
 
     # Refine pointing with initial matches — ONLY if it improves
     if refine and len(matches) >= _MIN_MATCHES_REFINE:

@@ -206,42 +206,35 @@ def fit_pointing_from_offsets(model, offsets, image_shape):
         "dy_spread": dy_spread,
     }
 
-    if dx_spread > 3.0 or dy_spread > 3.0:
-        # Offsets vary → need tilt/rotation correction, not just translation
-        # Fit (dcx, dcy, dalt0, drho) to the offset field
+    if dx_spread > 2.0 or dy_spread > 2.0:
+        # Offsets vary across the image → tilt/rotation correction needed.
+        # Fit (dcx, dcy, dalt0, drho, df) by computing how a model
+        # correction would shift predictions at each tile position.
         proj_type = model.proj_type
 
-        def residuals(params):
-            test = CameraModel(
-                cx=model.cx + params[0],
-                cy=model.cy + params[1],
-                az0=model.az0,
-                alt0=model.alt0 + params[2],
-                rho=model.rho + params[3],
-                f=model.f,
-                proj_type=proj_type,
-                k1=model.k1, k2=model.k2,
-            )
-            # For each tile, compute predicted offset
-            res = []
-            for o in offsets:
-                # Use tile center as test point
-                tcx, tcy = o["tile_x"] + 200, o["tile_y"] + 200
-                # Original model prediction at this point
-                # (we approximate: the offset IS the difference)
-                w = np.sqrt(o["n_matches"])
-                res.append(w * (params[0] - o["dx"]))  # approx
-                res.append(w * (params[1] - o["dy"]))
-            return np.array(res)
-
-        # Better: reproject a few catalog stars with the test model
-        # and compare predicted shift to measured shift
+        # For each tile, pick a representative catalog star position
+        # (the tile center in pixel coords → sky coords via current model)
         from .projection import CameraModel as CM
-        # Sample catalog stars spread across the image
-        sample_cat_az = np.radians(np.array([0, 90, 180, 270, 45, 135, 225, 315]))
-        sample_cat_alt = np.radians(np.array([45]*8))
+        tile_half = 200
 
-        def residuals_full(params):
+        # Precompute: original model predictions at representative
+        # points near each tile center.
+        rep_az = []
+        rep_alt = []
+        for o in offsets:
+            tcx = o["tile_x"] + tile_half
+            tcy = o["tile_y"] + tile_half
+            az_sky, alt_sky = model.pixel_to_sky(
+                np.array([float(tcx)]), np.array([float(tcy)]))
+            rep_az.append(float(az_sky[0]))
+            rep_alt.append(float(alt_sky[0]))
+        rep_az = np.array(rep_az)
+        rep_alt = np.array(rep_alt)
+
+        # Original predictions at representative points
+        orig_px, orig_py = model.sky_to_pixel(rep_az, rep_alt)
+
+        def residuals_tilt(params):
             test = CameraModel(
                 cx=model.cx + params[0],
                 cy=model.cy + params[1],
@@ -252,26 +245,26 @@ def fit_pointing_from_offsets(model, offsets, image_shape):
                 proj_type=proj_type,
                 k1=model.k1, k2=model.k2,
             )
-            # For each tile, predict what offset the corrected model would give
+            # Predicted pixel shift at each representative point
+            new_px, new_py = test.sky_to_pixel(rep_az, rep_alt)
+            pred_dx = new_px - orig_px
+            pred_dy = new_py - orig_py
+
             res = []
-            for o in offsets:
-                tcx = o["tile_x"] + 200
-                tcy = o["tile_y"] + 200
-                # Approximate: the correction shifts all predictions by
-                # a position-dependent amount
+            for i, o in enumerate(offsets):
                 w = np.sqrt(o["n_matches"])
-                # Use the measured offset as target
-                res.append(w * (params[0] - o["dx"]))
-                res.append(w * (params[1] - o["dy"]))
+                # Measured offset should match predicted offset
+                res.append(w * (pred_dx[i] - o["dx"]))
+                res.append(w * (pred_dy[i] - o["dy"]))
             return np.array(res)
 
         p0 = [med_dx, med_dy, 0.0, 0.0, 0.0]
-        bounds_lo = [med_dx - 20, med_dy - 20,
+        bounds_lo = [med_dx - 30, med_dy - 30,
                      -np.radians(5), -np.radians(5), -0.02]
-        bounds_hi = [med_dx + 20, med_dy + 20,
+        bounds_hi = [med_dx + 30, med_dy + 30,
                      np.radians(5), np.radians(5), 0.02]
 
-        result = least_squares(residuals_full, p0,
+        result = least_squares(residuals_tilt, p0,
                                bounds=(bounds_lo, bounds_hi),
                                loss='soft_l1', f_scale=2.0)
         p = result.x
@@ -291,5 +284,10 @@ def fit_pointing_from_offsets(model, offsets, image_shape):
         summary["dalt0_deg"] = float(np.degrees(p[2]))
         summary["drho_deg"] = float(np.degrees(p[3]))
         summary["df_pct"] = p[4] * 100
+
+        log.info("Tilt correction: dcx=%.1f dcy=%.1f dalt0=%.2f° "
+                 "drho=%.2f° df=%.2f%%",
+                 p[0], p[1], np.degrees(p[2]), np.degrees(p[3]),
+                 p[4] * 100)
 
     return corrected, summary
