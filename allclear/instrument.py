@@ -34,6 +34,7 @@ class InstrumentModel:
     k2: float = 0.0
     image_width: int = 3096
     image_height: int = 2080
+    mirrored: bool = False  # True if image is E-W flipped
 
     # --- Detection settings (reused in solve mode) ---
     detection_fwhm: float = 5.0
@@ -120,6 +121,7 @@ class InstrumentModel:
                 "k2": self.k2,
                 "image_width": self.image_width,
                 "image_height": self.image_height,
+                "mirrored": self.mirrored,
             },
             "detection": {
                 "fwhm": self.detection_fwhm,
@@ -166,6 +168,7 @@ class InstrumentModel:
             k2=cam.get("k2", 0.0),
             image_width=cam.get("image_width", 3096),
             image_height=cam.get("image_height", 2080),
+            mirrored=cam.get("mirrored", False),
             detection_fwhm=det.get("fwhm", 5.0),
             detection_threshold_sigma=det.get("threshold_sigma", 5.0),
             detection_n_brightest=det.get("n_brightest", 200),

@@ -22,6 +22,21 @@ from .matching import match_sources
 log = logging.getLogger(__name__)
 
 
+def _adaptive_min_peak_offset(background, p999):
+    """Compute adaptive min_peak_offset from image statistics.
+
+    Uses the lower of a noise-based threshold (15-sigma) and a
+    dynamic-range-based threshold (50% of p99.9-median).  Floored at 200
+    and capped at 3000.  This scales correctly for both high-background
+    images (dome glow, Haleakala) and low-background deep CCD images
+    (APICAM at Paranal).
+    """
+    noise_est = max(30.0, np.sqrt(abs(background)))
+    snr_based = 15.0 * noise_est
+    range_based = 0.5 * (p999 - background)
+    return max(200.0, min(3000.0, min(snr_based, range_based)))
+
+
 # ---------------------------------------------------------------------------
 # Strategy 1: Radial density profile → rough f, projection ranking
 # ---------------------------------------------------------------------------
@@ -489,7 +504,7 @@ def ransac_refine(image, cat_az_rad, cat_alt_rad, model,
     ny, nx = image.shape
     background = float(np.median(image))
     p999 = float(np.percentile(image, 99.9))
-    adaptive_mpo = max(500, min(3000, 0.5 * (p999 - background)))
+    adaptive_mpo = _adaptive_min_peak_offset(background, p999)
 
     # Generate candidate matches via guided matching at generous radius
     matches = _guided_match(image, model, cat_az_rad, cat_alt_rad,
@@ -692,7 +707,7 @@ def center_outward_refine(image, cat_az_rad, cat_alt_rad, model,
     ny, nx = image.shape
     background = float(np.median(image))
     p999 = float(np.percentile(image, 99.9))
-    _mpo = max(500, min(3000, 0.5 * (p999 - background)))
+    _mpo = _adaptive_min_peak_offset(background, p999)
     max_r = min(nx, ny) * 0.5
 
     current = model
@@ -829,6 +844,10 @@ def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
                   background, alt_min_rad=None, alt_max_rad=None):
     """Find the bright peak nearest each projected catalog star.
 
+    In dense star fields, the *brightest* pixel in the search box may
+    belong to a different star.  Instead, find the local maximum that
+    is closest to the predicted position and above ``min_peak``.
+
     Parameters
     ----------
     alt_min_rad, alt_max_rad : float or None
@@ -857,12 +876,31 @@ def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
         if max_val < min_peak:
             continue
 
-        # Centroid around the peak pixel
         box_float = box.astype(np.float64) - background
         box_float[box_float < 0] = 0
 
-        max_pos = np.unravel_index(np.argmax(box), box.shape)
-        my, mx = max_pos
+        # Find local maxima (pixels brighter than all 4 neighbours)
+        # and pick the one nearest to the box center (predicted pos).
+        padded = np.pad(box_float, 1, mode='constant',
+                        constant_values=0)
+        is_max = (box_float > padded[:-2, 1:-1]) & \
+                 (box_float > padded[2:, 1:-1]) & \
+                 (box_float > padded[1:-1, :-2]) & \
+                 (box_float > padded[1:-1, 2:]) & \
+                 (box > min_peak)
+
+        peak_ys, peak_xs = np.where(is_max)
+        if len(peak_ys) == 0:
+            # Fallback: just use the global maximum
+            max_pos = np.unravel_index(np.argmax(box), box.shape)
+            my, mx = max_pos
+        else:
+            # Pick the local maximum closest to the center (predicted pos)
+            dists = (peak_xs - r) ** 2 + (peak_ys - r) ** 2
+            nearest = np.argmin(dists)
+            my, mx = int(peak_ys[nearest]), int(peak_xs[nearest])
+
+        # Sub-pixel centroid around the chosen peak
         sr = 3
         sy0 = max(0, my - sr)
         sy1 = min(box.shape[0], my + sr + 1)
@@ -880,7 +918,7 @@ def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
 
         det_x = xi - r + cx_c
         det_y = yi - r + cy_c
-        matches.append((i, det_x, det_y, max_val))
+        matches.append((i, det_x, det_y, float(box[my, mx])))
 
     return matches
 
@@ -919,10 +957,13 @@ def _fit_model_to_pairs(det_x, det_y, cat_az, cat_alt, model,
 
     # Compute physically meaningful distortion bounds based on focal length.
     # At r = f (zenith angle ~1 rad), we want |k1*r^2| < 0.3 and |k2*r^4| < 0.15
-    # Fisheye lenses have barrel distortion (k1 ≤ 0).
+    # Fisheye lenses typically have barrel distortion (k1 ≤ 0) with equidistant
+    # projection, but lenses following equisolid or stereographic mappings
+    # appear slightly pincushion relative to equidistant.  Allow small positive
+    # k1 (up to 10% of k1_max) to handle these cases.
     f0 = model.f
     k1_max = 0.3 / (f0 * f0)          # typically ~2.5e-7 for f=1100
-    k1_hi = 0.0                        # k1 must be ≤ 0 for fisheye
+    k1_hi = k1_max * 0.1              # allow slight pincushion
     k2_max = 0.15 / (f0 ** 4)          # typically ~1e-13 for f=1100
 
     if fit_distortion:
@@ -1113,8 +1154,8 @@ def _fit_model_to_pairs(det_x, det_y, cat_az, cat_alt, model,
 # Model quality comparison
 # ---------------------------------------------------------------------------
 
-def _is_better(n_new, rms_new, n_old, rms_old, rms_threshold=10.0,
-               rms_reject=20.0):
+def _is_better(n_new, rms_new, n_old, rms_old, rms_threshold=7.0,
+               rms_reject=15.0):
     """Decide if a new model is better than the current best.
 
     Uses a quality score that balances match count with RMS.  A model
@@ -1129,13 +1170,18 @@ def _is_better(n_new, rms_new, n_old, rms_old, rms_threshold=10.0,
     if rms_new > rms_reject and rms_old <= rms_reject:
         return False
 
-    # If new RMS is much worse, reject
-    if rms_new > rms_threshold and rms_new > rms_old * 1.5:
-        return False
+    # If new RMS is much worse, reject — high-RMS results are likely
+    # contaminated with false matches from dense star fields.
+    # But skip this check when the old model has too few matches to be
+    # reliable (< 50 matches can easily be coincidental in dense fields).
+    if n_old >= 50:
+        if rms_new > rms_threshold and rms_new > rms_old * 1.3:
+            return False
 
-    # Quality score: n_matched / (1 + rms)
-    score_new = n_new / (1.0 + rms_new)
-    score_old = n_old / (1.0 + rms_old)
+    # Quality score: n_matched / (1 + rms²) — quadratic RMS penalty
+    # discourages trading precision for match count.
+    score_new = n_new / (1.0 + rms_new * rms_new)
+    score_old = n_old / (1.0 + rms_old * rms_old)
     return score_new > score_old
 
 
@@ -1148,7 +1194,7 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
                         cx, cy, nx, ny,
                         f_range=(700, 1400), n_bright_det=25,
                         vmag_limit=3.0, match_radius=15.0,
-                        verbose=False):
+                        verbose=False, rho_hint=None):
     """Blind camera model solve using hypothesis-and-verify.
 
     For each bright detection × bright catalog star, hypothesizes they
@@ -1241,9 +1287,13 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
     best_cy = cy
     n_hypotheses = 0
 
-    # Center search grid: offsets from horizon-detected center
-    cx_offsets = np.arange(-100, 125, 50)  # 5 values
-    cy_offsets = np.arange(-175, 200, 50)  # 8 values
+    # Center search grid: offsets from horizon-detected center.
+    # Scale with image size — large-sensor cameras can have the
+    # optical center 200+ px from the horizon center.
+    cx_span = max(100, min(250, nx // 16))
+    cy_span = max(175, min(350, ny // 12))
+    cx_offsets = np.arange(-cx_span, cx_span + 1, 50)
+    cy_offsets = np.arange(-cy_span, cy_span + 1, 50)
 
     for dcx in cx_offsets:
         for dcy in cy_offsets:
@@ -1266,6 +1316,14 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
 
                     # phi = az + az0 + rho; with az0=0: rho = PA - az
                     implied_rho = (dpa[i] - bcat_az[j]) % (2 * np.pi)
+
+                    # If a rotation hint is given, skip hypotheses
+                    # that are far from the hint.
+                    if rho_hint is not None:
+                        drho = abs((implied_rho - rho_hint + np.pi)
+                                   % (2 * np.pi) - np.pi)
+                        if drho > np.radians(30):
+                            continue
 
                     n_hypotheses += 1
 
@@ -1464,7 +1522,8 @@ def guided_refine(image, cat_az, cat_alt, model, n_iterations=12,
                   bright_mag_limit=None, min_peak_offset=None,
                   alt_min_deg=None, alt_max_deg=None, fix_az0=False,
                   fit_distortion=False,
-                  horizon_r=None, horizon_weight=1.0):
+                  horizon_r=None, horizon_weight=1.0,
+                  initial_search_radius=30):
     """Iterative guided-match refinement of a camera model.
 
     Parameters
@@ -1518,13 +1577,13 @@ def guided_refine(image, cat_az, cat_alt, model, n_iterations=12,
 
     if min_peak_offset is None:
         p999 = float(np.percentile(image, 99.9))
-        min_peak_offset = max(500, min(3000, 0.5 * (p999 - background)))
+        min_peak_offset = _adaptive_min_peak_offset(background, p999)
 
     alt_min_rad = np.radians(alt_min_deg) if alt_min_deg is not None else None
     alt_max_rad = np.radians(alt_max_deg) if alt_max_deg is not None else None
 
     for iteration in range(n_iterations):
-        search_r = max(8, int(30 * (0.85 ** iteration)))
+        search_r = max(10, int(initial_search_radius * (0.90 ** iteration)))
         min_peak = background + min_peak_offset
 
         matches = _guided_match(image, current, cat_az, cat_alt,
@@ -1539,14 +1598,14 @@ def guided_refine(image, cat_az, cat_alt, model, n_iterations=12,
         cat_az_m = np.array([cat_az[m[0]] for m in matches])
         cat_alt_m = np.array([cat_alt[m[0]] for m in matches])
 
-        # Sigma-clip outlier matches (important when using linear loss,
-        # which has no built-in robustness to bad matches)
-        if fit_distortion and len(matches) > 10:
+        # Sigma-clip outlier matches — essential in dense star fields
+        # where the nearest local maximum may be a different star.
+        if len(matches) > 10:
             px_pre, py_pre = current.sky_to_pixel(cat_az_m, cat_alt_m)
             resid = np.sqrt((px_pre - det_x_m) ** 2 +
                             (py_pre - det_y_m) ** 2)
             med_r = np.median(resid)
-            clip_threshold = max(15.0, med_r + 3.0 * np.std(resid))
+            clip_threshold = max(10.0, med_r + 2.5 * np.std(resid))
             good = resid < clip_threshold
             if np.sum(good) >= 6:
                 det_x_m = det_x_m[good]
@@ -2035,7 +2094,7 @@ def _guided_match_count(image, model, cat_az, cat_alt, search_radius=15,
     background = float(np.median(image))
     if min_peak_offset is None:
         p999 = float(np.percentile(image, 99.9))
-        min_peak_offset = max(500, min(3000, 0.5 * (p999 - background)))
+        min_peak_offset = _adaptive_min_peak_offset(background, p999)
     min_peak = background + min_peak_offset
 
     px, py = model.sky_to_pixel(cat_az, cat_alt)
@@ -2372,11 +2431,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     cy0 = ny / 2.0
     diag = {}
 
-    # Adaptive min_peak_offset: scale to the image's dynamic range.
-    # Use 50% of (p99.9 - median), floored at 500 and capped at 3000.
+    # Adaptive min_peak_offset: noise-aware threshold.
     background = float(np.median(image))
     p999 = float(np.percentile(image, 99.9))
-    min_peak_offset = max(500, min(3000, 0.5 * (p999 - background)))
+    min_peak_offset = _adaptive_min_peak_offset(background, p999)
     if verbose:
         log.info(f"  Adaptive min_peak_offset: {min_peak_offset:.0f} "
                  f"(bg={background:.0f}, p99.9={p999:.0f})")
@@ -2442,6 +2500,45 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                  f"R={hc_R:.0f}, n={hc_n}")
         log.info(f"  Implied f (equidistant): {f_from_horizon:.0f}")
 
+    # --- Step 1b: Density-based rotation estimate ---
+    # The Milky Way creates a strong azimuthal density signal in both
+    # the image detections and the star catalog.  Cross-correlating these
+    # profiles gives a robust initial rho estimate that prevents the
+    # pattern matcher from locking onto the wrong rotation.
+    rho_density = None
+    if hc_n >= 20:
+        det_x_arr = np.asarray(det_table["x"], dtype=np.float64)
+        det_y_arr = np.asarray(det_table["y"], dtype=np.float64)
+        det_r_arr = np.sqrt((det_x_arr - cx_est) ** 2 +
+                            (det_y_arr - cy_est) ** 2)
+        # Mid-radius detections only (avoid center artifacts and horizon)
+        mid = (det_r_arr > hc_R * 0.15) & (det_r_arr < hc_R * 0.85)
+        if np.sum(mid) >= 50:
+            det_pa = np.arctan2(det_x_arr[mid] - cx_est,
+                                det_y_arr[mid] - cy_est)
+            n_bins = 72  # 5° bins
+            det_hist, _ = np.histogram(det_pa, bins=n_bins,
+                                        range=(-np.pi, np.pi))
+            # Catalog azimuthal profile (mid-altitude, bright)
+            cat_mid = (cat_alt_deg >= 15) & (cat_alt_deg <= 75) & \
+                      (vmag_ext < 6.5)
+            if np.sum(cat_mid) >= 50:
+                cat_pa0 = cat_az[cat_mid]  # PA at rho=0
+                cat_hist0, _ = np.histogram(cat_pa0, bins=n_bins,
+                                             range=(-np.pi, np.pi))
+                # Cross-correlate
+                dn = det_hist.astype(float) - np.mean(det_hist)
+                cn = cat_hist0.astype(float) - np.mean(cat_hist0)
+                corrs = np.array([np.dot(dn, np.roll(cn, s))
+                                  for s in range(n_bins)])
+                best_shift = int(np.argmax(corrs))
+                rho_density = best_shift * (2 * np.pi / n_bins)
+                if rho_density > np.pi:
+                    rho_density -= 2 * np.pi
+                if verbose:
+                    log.info(f"Step 1b: Density rotation estimate: "
+                             f"rho={np.degrees(rho_density):.0f}°")
+
     # --- Step 2: Blind pattern-matching solve ---
     # This replaces the old compact-arc + guided-refine approach.
     # Searches over (f, rho, az0, alt0) simultaneously without assuming
@@ -2475,22 +2572,53 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     pm_diag = {}
     pm_candidates = []
 
-    for fri, fr in enumerate(f_ranges):
-        m, n, r, d = pattern_match_solve(
-            pm_det_x, pm_det_y, cat_az, cat_alt, vmag_ext,
-            cx=cx_est, cy=cy_est, nx=nx, ny=ny,
-            f_range=fr, verbose=verbose,
-        )
-        if m is not None and n >= 10:
-            pm_candidates.append((m, n, r, d, fr))
-            if verbose:
-                log.info(f"  f_range {fr[0]:.0f}-{fr[1]:.0f}: "
-                         f"{n} matches, RMS={r:.1f}, f={m.f:.0f}")
+    # Scale anchor count with image size — bigger sensors benefit from
+    # more hypotheses, and in dense fields the top-25 detections are
+    # more likely to be real stars (not dome/obstruction artifacts).
+    n_anchor = max(25, min(50, len(pm_det_x) // 20))
+
+    # Test both normal and mirrored (E-W flipped) orientations.
+    # Some cameras produce mirrored images depending on their optical
+    # train.  We run pattern_match_solve for both and keep the best.
+    is_mirrored = False
+    pm_det_x_mirror = (nx - 1) - pm_det_x  # flip x about image center
+
+    for label, det_x_use in [("normal", pm_det_x),
+                              ("mirror", pm_det_x_mirror)]:
+        for fr in f_ranges:
+            m, n, r, d = pattern_match_solve(
+                det_x_use, pm_det_y, cat_az, cat_alt, vmag_ext,
+                cx=cx_est, cy=cy_est, nx=nx, ny=ny,
+                f_range=fr, n_bright_det=n_anchor, verbose=False,
+            )
+            if m is not None and n >= 10:
+                # Tag mirrored candidates so we know to flip later
+                d["_mirrored"] = (label == "mirror")
+                pm_candidates.append((m, n, r, d, fr))
+                if verbose:
+                    log.info(f"  {label} f_range {fr[0]:.0f}-{fr[1]:.0f}: "
+                             f"{n} matches, RMS={r:.1f}, f={m.f:.0f}")
+
+    # Also run with density-derived rho hint (both orientations).
+    if rho_density is not None:
+        for label, det_x_use in [("normal", pm_det_x),
+                                  ("mirror", pm_det_x_mirror)]:
+            for fr in f_ranges:
+                m, n, r, dd = pattern_match_solve(
+                    det_x_use, pm_det_y, cat_az, cat_alt, vmag_ext,
+                    cx=cx_est, cy=cy_est, nx=nx, ny=ny,
+                    f_range=fr, n_bright_det=n_anchor, verbose=False,
+                    rho_hint=rho_density,
+                )
+                if m is not None and n >= 10:
+                    dd["_mirrored"] = (label == "mirror")
+                    pm_candidates.append((m, n, r, dd, fr))
 
     if pm_candidates:
         # Filter by horizon consistency: for an all-sky camera, f must
         # produce a horizon radius close to what we observed.  Reject
         # solutions where f is far from the horizon-implied value.
+        n_pre = len(pm_candidates)
         if hr is not None and f_from_horizon > 100:
             consistent = [c for c in pm_candidates
                           if abs(c[0].f - f_from_horizon) / f_from_horizon < 0.35]
@@ -2499,23 +2627,36 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                 if verbose:
                     log.info("  Horizon filter: kept %d/%d candidates "
                              "(f within 35%% of %.0f)",
-                             len(consistent),
-                             len(pm_candidates) + len(consistent) - len(consistent),
-                             f_from_horizon)
+                             len(consistent), n_pre, f_from_horizon)
 
-        # Pick candidate with lowest RMS (more reliable than match count
-        # for discriminating correct vs coincidental solutions)
-        pm_candidates.sort(key=lambda c: c[2])
+        # Pick candidate with best score
+        pm_candidates.sort(key=lambda c: -c[1] / (1.0 + c[2] * c[2]))
         pm_model, pm_n, pm_rms, pm_diag, _ = pm_candidates[0]
+
+        # If best candidate came from mirrored pass, flip the image
+        # and detection table so all subsequent processing uses the
+        # correct orientation.
+        if pm_diag.get("_mirrored", False):
+            is_mirrored = True
+            image = image[:, ::-1]  # flip x-axis
+            # Update detection table x-coordinates
+            det_x_arr = np.asarray(det_table["x"], dtype=np.float64)
+            det_table["x"] = (nx - 1) - det_x_arr
+            if verbose:
+                log.info("  Image is MIRRORED (E-W flipped) — "
+                         "flipping for processing")
+
     diag["pattern_match"] = pm_diag
+    diag["mirrored"] = is_mirrored
+
+    if verbose:
+        log.info(f"  Best after Step 2: {pm_n} matches, RMS={pm_rms:.1f}"
+                 f"{' (mirrored)' if is_mirrored else ''}")
 
     if pm_model is not None and pm_n >= 10:
         best_model = pm_model
         best_n = pm_n
         best_rms = pm_rms
-        if verbose:
-            log.info(f"  Pattern match succeeded: {pm_n} matches, "
-                     f"RMS={pm_rms:.1f}")
     else:
         # Fallback to old compact-arc approach
         if verbose:
@@ -2632,7 +2773,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                     rhs = (R_horiz - b) / (b ** 3)
                     return lhs - rhs
 
-                f_solved = brentq(f_eq, 400, 3000)
+                f_lo = max(100, best_model.f * 0.5)
+                f_hi = max(3000, best_model.f * 3)
+                f_solved = brentq(f_eq, f_lo, f_hi)
                 a = f_solved * med_theta
                 k1_solved = (med_r - a) / (a ** 3)
 
@@ -2648,8 +2791,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                     log.info(f"  Horizon: r_model={r_h_check:.0f}px "
                              f"(observed {R_horiz:.0f}px)")
 
-                # Clamp k1 to ≤ 0 for fisheye (barrel distortion)
-                if k1_solved > 0:
+                # Clamp k1: allow slight pincushion (up to 10% of
+                # k1_max) to accommodate non-equidistant lenses.
+                k1_limit = 0.1 * 0.3 / (f_solved * f_solved)
+                if k1_solved > k1_limit:
                     k1_solved = 0.0
                     f_solved = best_model.f
 
@@ -2666,6 +2811,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                                             best_model.proj_type)
                 k1_seed = ((hc_R / r_horiz_model - 1.0) /
                            (r_horiz_model ** 2))
+                # Clamp k1: allow slight pincushion
+                k1_limit = 0.1 * 0.3 / (best_model.f ** 2)
+                if k1_seed > k1_limit:
+                    k1_seed = k1_limit
                 dist_seed = CameraModel(
                     cx=best_model.cx, cy=best_model.cy,
                     az0=best_model.az0, alt0=best_model.alt0,
@@ -2683,6 +2832,87 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         dist_seed = best_model
         if verbose:
             log.info("  No horizon circle, skipping k1 seed")
+
+    # --- Step 5b: Projection type search ---
+    # If the two-constraint solver needed positive k1 (clamped),
+    # equidistant may be the wrong base projection.  Try stereographic
+    # and equisolid, which naturally map the horizon farther out.
+    # The best alternative becomes the dist_seed for Step 6, where full
+    # distortion fitting will determine the final quality.
+    alt_proj_seed = None
+    if (hc_n >= 20 and dist_seed.k1 == 0.0 and
+            dist_seed.proj_type == ProjectionType.EQUIDISTANT):
+        r_h_equi = _theta_to_r(np.pi / 2, dist_seed.f,
+                                ProjectionType.EQUIDISTANT)
+        if abs(r_h_equi - hc_R) / hc_R > 0.25:
+            if verbose:
+                log.info("Step 5b: Projection type search "
+                         f"(equidistant horizon mismatch: "
+                         f"{r_h_equi:.0f} vs {hc_R:.0f}px)")
+            best_alt_n = 0
+            best_alt_rms = 999.0
+            for alt_proj in [ProjectionType.STEREOGRAPHIC,
+                             ProjectionType.EQUISOLID]:
+                f_alt = hc_R / _theta_to_r(np.pi / 2, 1.0, alt_proj)
+                alt_model = CameraModel(
+                    cx=best_model.cx, cy=best_model.cy,
+                    az0=best_model.az0, alt0=best_model.alt0,
+                    rho=best_model.rho, f=f_alt,
+                    proj_type=alt_proj,
+                )
+                # Wide initial match to bridge the projection difference
+                # (positions can shift 40-80px from equidistant → alt).
+                wide_matches = _guided_match(
+                    image, alt_model, med_az, med_alt,
+                    search_radius=80,
+                    min_peak=background + min_peak_offset,
+                    background=background,
+                    alt_min_rad=np.radians(20),
+                    alt_max_rad=np.radians(80),
+                )
+                if len(wide_matches) >= 10:
+                    det_x_w = np.array([m[1] for m in wide_matches])
+                    det_y_w = np.array([m[2] for m in wide_matches])
+                    cat_az_w = np.array([med_az[m[0]]
+                                         for m in wide_matches])
+                    cat_alt_w = np.array([med_alt[m[0]]
+                                          for m in wide_matches])
+                    try:
+                        alt_model = _fit_model_to_pairs(
+                            det_x_w, det_y_w, cat_az_w, cat_alt_w,
+                            alt_model, fix_az0=True,
+                            horizon_r=hr, horizon_weight=1.0,
+                        )
+                    except Exception:
+                        pass
+                m_alt, n_alt, rms_alt = guided_refine(
+                    image, med_az, med_alt, alt_model,
+                    n_iterations=15,
+                    min_peak_offset=min_peak_offset,
+                    alt_min_deg=10, alt_max_deg=80,
+                    fix_az0=True,
+                    horizon_r=hr, horizon_weight=1.0,
+                )
+                if verbose:
+                    log.info(f"  {alt_proj.value}: f={f_alt:.0f} → "
+                             f"{n_alt} matches, RMS={rms_alt:.1f}")
+                if n_alt >= 50 and _is_better(n_alt, rms_alt,
+                                               best_alt_n, best_alt_rms):
+                    best_alt_n = n_alt
+                    best_alt_rms = rms_alt
+                    alt_proj_seed = CameraModel(
+                        cx=m_alt.cx, cy=m_alt.cy,
+                        az0=m_alt.az0, alt0=m_alt.alt0,
+                        rho=m_alt.rho, f=m_alt.f,
+                        proj_type=alt_proj,
+                        k1=m_alt.k1, k2=m_alt.k2,
+                    )
+            if alt_proj_seed is not None:
+                if verbose:
+                    log.info(f"  Alt projection seed: "
+                             f"{alt_proj_seed.proj_type.value} "
+                             f"({best_alt_n} matches, "
+                             f"RMS={best_alt_rms:.1f})")
 
     # --- Step 6: Joint geometry + distortion refinement ---
     # Use guided matching (finds many matches) with f_scale=50 in the
@@ -2779,6 +3009,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     deep_mask = vmag_ext < 5.5
     deep_az = cat_az[deep_mask]
     deep_alt = cat_alt[deep_mask]
+    # Use a tighter search radius for Phase E since the model is already
+    # well-refined.  In dense star fields, a large radius grabs wrong stars.
+    phase_e_sr = max(12, min(30, int(best_rms * 2.5)))
     m6e, n6e, rms6e = guided_refine(
         image, deep_az, deep_alt, best_model,
         n_iterations=15,
@@ -2787,6 +3020,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         fix_az0=False,
         fit_distortion=True,
         horizon_r=hr, horizon_weight=1.0,
+        initial_search_radius=phase_e_sr,
     )
     if verbose:
         r_h = _apply_distortion(
@@ -2800,6 +3034,68 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         best_model = m6e
         best_n = n6e
         best_rms = rms6e
+
+    # Phase F: Alternative projection (if Step 5b found one).
+    # First stabilize geometry (no distortion), then add distortion.
+    if alt_proj_seed is not None:
+        if verbose:
+            log.info(f"  Phase F (alt projection: "
+                     f"{alt_proj_seed.proj_type.value})")
+        # F.1: Geometry-only refinement to stabilize the model
+        mf_g, nf_g, rmsf_g = guided_refine(
+            image, med_az, med_alt, alt_proj_seed,
+            n_iterations=15,
+            min_peak_offset=min_peak_offset,
+            alt_min_deg=15, alt_max_deg=75,
+            fix_az0=True,
+            fit_distortion=False,
+            horizon_r=hr, horizon_weight=1.0,
+        )
+        # F.2: Add distortion fitting from the stabilized model
+        mf_a, nf_a, rmsf_a = guided_refine(
+            image, wide_az, wide_alt, mf_g,
+            n_iterations=15,
+            min_peak_offset=min_peak_offset,
+            alt_min_deg=10, alt_max_deg=80,
+            fix_az0=near_zenith,
+            fit_distortion=True,
+            horizon_r=hr, horizon_weight=2.0,
+        )
+        # F.3: Widen altitude range
+        mf_b, nf_b, rmsf_b = guided_refine(
+            image, wide_az, wide_alt, mf_a,
+            n_iterations=15,
+            min_peak_offset=min_peak_offset,
+            alt_min_deg=5, alt_max_deg=88,
+            fix_az0=near_zenith,
+            fit_distortion=True,
+            horizon_r=hr, horizon_weight=1.0,
+        )
+        # F.4: Detection-based refinement
+        mf_d, nf_d, rmsf_d = detection_refine(
+            det_table, full_az, full_alt, mf_b,
+            n_iterations=20,
+            alt_min_deg=3, alt_max_deg=88,
+            fix_az0=near_zenith,
+            fit_distortion=True,
+            horizon_r=hr, horizon_weight=1.0,
+        )
+        # Pick best from alt-projection phases
+        for m_cand, n_cand, rms_cand in [(mf_a, nf_a, rmsf_a),
+                                          (mf_b, nf_b, rmsf_b),
+                                          (mf_d, nf_d, rmsf_d)]:
+            if _is_better(n_cand, rms_cand, best_n, best_rms):
+                best_model = m_cand
+                best_n = n_cand
+                best_rms = rms_cand
+        if verbose:
+            log.info(f"    geom: {nf_g} matches, RMS={rmsf_g:.1f}")
+            log.info(f"    +dist: {nf_a} matches, RMS={rmsf_a:.1f}, "
+                     f"f={mf_a.f:.0f}")
+            log.info(f"    wide: {nf_b} matches, RMS={rmsf_b:.1f}, "
+                     f"f={mf_b.f:.0f}")
+            log.info(f"    det:  {nf_d} matches, RMS={rmsf_d:.1f}, "
+                     f"f={mf_d.f:.0f}")
 
     # --- Step 7: Residual diagnostics ---
     if verbose:
