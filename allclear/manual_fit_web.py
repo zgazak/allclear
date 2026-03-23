@@ -193,6 +193,46 @@ class ManualFitWeb:
                     "category": obj["category"],
                 })
 
+        # Cardinal direction labels at horizon
+        if self.model is not None:
+            result["cardinals"] = []
+            cardinals = {0: "N", 45: "NE", 90: "E", 135: "SE",
+                         180: "S", 225: "SW", 270: "W", 315: "NW"}
+            for az_deg, label in cardinals.items():
+                px_c, py_c = self.model.sky_to_pixel(
+                    np.array([np.radians(az_deg)]),
+                    np.array([np.radians(8.0)]))  # 8° alt (near horizon)
+                x, y = float(px_c[0]), float(py_c[0])
+                if (np.isfinite(x) and np.isfinite(y)
+                        and -50 < x < self.nx + 50
+                        and -50 < y < self.ny + 50):
+                    result["cardinals"].append({
+                        "label": label, "x": x, "y": y})
+
+            # Milky Way path (galactic plane b=0 traced across the sky)
+            result["milky_way"] = []
+            from astropy.coordinates import SkyCoord, EarthLocation, AltAz
+            import astropy.units as u
+            loc = EarthLocation(
+                lat=self.meta["lat_deg"] * u.deg,
+                lon=self.meta["lon_deg"] * u.deg)
+            frame = AltAz(obstime=self.meta["obs_time"], location=loc)
+            gal_l = np.linspace(0, 360, 180)
+            for l_deg in gal_l:
+                gc = SkyCoord(l=l_deg * u.deg, b=0 * u.deg,
+                              frame='galactic')
+                altaz = gc.transform_to(frame)
+                if altaz.alt.deg < 3:
+                    continue
+                px_m, py_m = self.model.sky_to_pixel(
+                    np.array([altaz.az.rad]),
+                    np.array([altaz.alt.rad]))
+                x, y = float(px_m[0]), float(py_m[0])
+                if (np.isfinite(x) and np.isfinite(y)
+                        and -20 < x < self.nx + 20
+                        and -20 < y < self.ny + 20):
+                    result["milky_way"].append({"x": x, "y": y})
+
         # Include current corrections with UPDATED predicted positions
         # from the current model (so arrows track model changes).
         if self.model is not None:
@@ -800,6 +840,66 @@ function drawOverlays(data) {
             }).addTo(map);
             namedMarkers.push(lbl);
         });
+    }
+
+    // Draw cardinal direction labels
+    if (data.cardinals) {
+        data.cardinals.forEach(c => {
+            let labelIcon = L.divIcon({
+                html: '<span style="color:white;font-size:14px;font-weight:bold;' +
+                    'text-shadow:0 0 4px black,0 0 4px black;pointer-events:none;">' +
+                    c.label + '</span>',
+                className: '',
+                iconSize: [30, 18],
+                iconAnchor: [15, 9],
+            });
+            let m = L.marker([c.y, c.x], {icon: labelIcon, interactive: false}).addTo(map);
+            namedMarkers.push(m);
+        });
+    }
+
+    // Draw Milky Way path (galactic plane)
+    if (data.milky_way && data.milky_way.length > 2) {
+        // Sort by x to form a connected path, then split on large gaps
+        let pts = data.milky_way.map(p => [p.y, p.x]);
+        // Split into segments where distance > 100px
+        let segments = [];
+        let seg = [pts[0]];
+        for (let i = 1; i < pts.length; i++) {
+            let dy = pts[i][0] - pts[i-1][0];
+            let dx = pts[i][1] - pts[i-1][1];
+            if (Math.sqrt(dx*dx + dy*dy) > 100) {
+                if (seg.length >= 2) segments.push(seg);
+                seg = [];
+            }
+            seg.push(pts[i]);
+        }
+        if (seg.length >= 2) segments.push(seg);
+
+        segments.forEach(s => {
+            let line = L.polyline(s, {
+                color: '#8888ff',
+                weight: 2,
+                opacity: 0.5,
+                dashArray: '8,6',
+                interactive: false,
+            }).addTo(map);
+            namedMarkers.push(line);
+        });
+
+        // Label
+        if (pts.length > 0) {
+            let mid = pts[Math.floor(pts.length / 2)];
+            let mwLabel = L.divIcon({
+                html: '<span style="color:#8888ff;font-size:11px;font-style:italic;' +
+                    'text-shadow:0 0 3px black;">Milky Way</span>',
+                className: '',
+                iconSize: [80, 14],
+                iconAnchor: [40, 7],
+            });
+            let m = L.marker(mid, {icon: mwLabel, interactive: false}).addTo(map);
+            namedMarkers.push(m);
+        }
     }
 
     // Draw corrections
