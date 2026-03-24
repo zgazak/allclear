@@ -41,30 +41,34 @@ def _render_image_png(image, mirrored=False):
     bytes
         PNG image data.
     """
-    from PIL import Image
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    data = image.copy()
+    data = image.copy().astype(np.float64)
     if mirrored:
         data = data[:, ::-1]
 
-    # Percentile stretch
-    vmin, vmax = np.percentile(data, [1, 99.5])
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    scaled = np.clip((data - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+    # Use matplotlib's rendering — same as the diagnostic plots
+    vmin = float(np.percentile(data, 0.5))
+    vmax = float(np.percentile(data, 99.9))
 
-    # Flip vertically: FITS has origin="lower" but PNG has origin at top.
-    # We will handle this in Leaflet by setting the image bounds so that
-    # y=0 (bottom row of FITS) maps to Leaflet y=0. Leaflet's CRS.Simple
-    # has y increasing upward, so we need the PNG to be stored in the
-    # normal top-down order and tell Leaflet the bounds go from [0,0] to
-    # [ny, nx].  Since PNG row 0 = top = FITS row ny-1, we flip here.
-    scaled = scaled[::-1]
+    ny, nx = data.shape
+    dpi = 100
+    fig = plt.figure(figsize=(nx / dpi, ny / dpi), dpi=dpi)
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    ax = fig.add_subplot(111)
+    ax.imshow(data, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
+    ax.set_xlim(0, nx - 1)
+    ax.set_ylim(0, ny - 1)
+    ax.axis("off")
 
-    img = Image.fromarray(scaled, mode='L')
     buf = io.BytesIO()
-    img.save(buf, format='PNG', optimize=True)
-    return buf.getvalue()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                pad_inches=0, facecolor="black")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 def _find_free_port(start=8765, end=8865):
@@ -157,7 +161,7 @@ class ManualFitWeb:
             order = np.argsort(vmag)
             n_shown = 0
             for i in order:
-                if n_shown >= 500:
+                if n_shown >= 1000:
                     break
                 cx, cy = float(cat_x[i]), float(cat_y[i])
                 if not (np.isfinite(cx) and np.isfinite(cy)
@@ -788,16 +792,18 @@ function clearOverlays() {
 function drawOverlays(data) {
     clearOverlays();
 
-    // Draw catalog stars as red circle markers
+    // Draw catalog stars as red circle markers — scaled by brightness
     if (data.catalog_stars) {
         data.catalog_stars.forEach(star => {
-            let radius = Math.max(2, Math.min(8, 8 - star.vmag * 0.8));
+            let radius = Math.max(3, Math.min(12, 12 - star.vmag * 1.2));
+            let weight = star.vmag < 3 ? 2.0 : 1.5;
+            let opacity = star.vmag < 4 ? 0.9 : 0.7;
             let m = L.circleMarker([star.y, star.x], {
                 radius: radius,
-                color: '#ff4444',
-                weight: 1,
+                color: '#ff5555',
+                weight: weight,
                 fillOpacity: 0,
-                opacity: 0.6,
+                opacity: opacity,
             }).addTo(map);
             m._starData = {type: 'catalog', idx: star.idx, az_deg: star.az_deg,
                            alt_deg: star.alt_deg, label: 'v=' + star.vmag.toFixed(1),
