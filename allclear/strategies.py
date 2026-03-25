@@ -916,6 +916,24 @@ def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
         else:
             cy_c, cx_c = float(my), float(mx)
 
+        # Point-source check: the peak must be significantly brighter
+        # than the local background (edge pixels of a 15×15 box).
+        # Rejects dome glow, illuminated clouds, and telescope
+        # structure which have similar peak and edge brightness.
+        abs_x = xi - r + mx
+        abs_y = yi - r + my
+        edge_r = 7
+        if (abs_x - edge_r >= 0 and abs_x + edge_r < nx and
+                abs_y - edge_r >= 0 and abs_y + edge_r < ny):
+            peak_val = float(image[abs_y, abs_x])
+            edge_box = image[abs_y - edge_r:abs_y + edge_r + 1,
+                             abs_x - edge_r:abs_x + edge_r + 1]
+            edge_mask_arr = np.ones(edge_box.shape, dtype=bool)
+            edge_mask_arr[2:-2, 2:-2] = False
+            local_bg = float(np.median(edge_box[edge_mask_arr]))
+            if peak_val - local_bg < min_peak - background:
+                continue
+
         det_x = xi - r + cx_c
         det_y = yi - r + cy_c
         matches.append((i, det_x, det_y, float(box[my, mx])))
@@ -1194,7 +1212,8 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
                         cx, cy, nx, ny,
                         f_range=(700, 1400), n_bright_det=25,
                         vmag_limit=3.0, match_radius=15.0,
-                        verbose=False, rho_hint=None):
+                        verbose=False, rho_hint=None,
+                        alt0_range=None):
     """Blind camera model solve using hypothesis-and-verify.
 
     For each bright detection × bright catalog star, hypothesizes they
@@ -1238,6 +1257,16 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
     """
     diag = {}
     f_min, f_max = f_range
+
+    # Build alt0 grids from range.
+    if alt0_range is None:
+        alt0_range = (85, 93)
+    alt0_lo, alt0_hi = alt0_range
+    alt0_coarse = list(range(alt0_lo, alt0_hi + 1, 2))
+    if 90 not in alt0_coarse and alt0_lo <= 90 <= alt0_hi:
+        alt0_coarse.append(90)
+        alt0_coarse.sort()
+    alt0_fine = list(range(max(80, alt0_lo - 2), min(95, alt0_hi + 3)))
 
     # --- Phase 1: Build KDTree for verification ---
     n_verify_det = min(200, len(det_x))
@@ -1328,7 +1357,7 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
                     n_hypotheses += 1
 
                     # Test with a few alt0 values
-                    for alt0_deg in [89, 90, 91]:
+                    for alt0_deg in alt0_coarse:
                         alt0 = np.radians(alt0_deg)
                         m = CameraModel(
                             cx=cx_try, cy=cy_try, az0=0.0,
@@ -1391,7 +1420,7 @@ def pattern_match_solve(det_x, det_y, cat_az, cat_alt, cat_vmag,
                     continue
                 for drho in np.arange(-3, 3.5, 0.5):
                     rho_try = best_rho + np.radians(drho)
-                    for alt0_deg in [88, 89, 90, 91, 92]:
+                    for alt0_deg in alt0_fine:
                         alt0 = np.radians(alt0_deg)
                         m = CameraModel(
                             cx=cx_try, cy=cy_try, az0=0.0,
@@ -1722,7 +1751,7 @@ def detection_refine(det_table, cat_az, cat_alt, model, n_iterations=12,
 
 
 def detect_horizon_circle(image, cx_est=None, cy_est=None,
-                          threshold=None, r_min=400, r_max=None):
+                          threshold=None, r_min=None, r_max=None):
     """Detect the sky/dome boundary circle in an all-sky image.
 
     Uses two methods and picks the larger radius:
@@ -1766,6 +1795,9 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
         cy_est = ny / 2.0
     if r_max is None:
         r_max = np.sqrt(cx_est**2 + cy_est**2) + 200
+    if r_min is None:
+        half_min = min(cx_est, cy_est, nx - cx_est, ny - cy_est)
+        r_min = max(100, min(400, half_min * 0.3))
 
     # Determine threshold between sky and dark levels.
     # Sky = median brightness in the center; dark = median of the image
@@ -2390,7 +2422,7 @@ def pixel_brightness_grid_search(image, cat_az, cat_alt, cx, cy,
 
 
 def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
-                            verbose=False):
+                            verbose=False, meta=None):
     """Full instrument characterization pipeline.
 
     Pipeline strategy:
@@ -2495,6 +2527,12 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     # Horizon radius for constraining f (and breaking f/k1 degeneracy)
     hr = hc_R if hc_n >= 20 else None
 
+    # Alt0 range: always use (87, 93) which covers cameras tilted
+    # up to 3° from zenith.  This is wide enough for Liverpool
+    # (alt0=88.5°) without introducing false hypotheses at extreme
+    # tilt angles that confuse Haleakala/APICAM.
+    alt0_range_deg = (87, 93)
+
     if verbose:
         log.info(f"  Horizon circle: center=({hc_cx:.0f}, {hc_cy:.0f}), "
                  f"R={hc_R:.0f}, n={hc_n}")
@@ -2546,9 +2584,73 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     if verbose:
         log.info("Step 2: Blind pattern-matching solve")
 
-    # Build detection arrays from det_table
-    pm_det_x = np.asarray(det_table["x"], dtype=np.float64)
-    pm_det_y = np.asarray(det_table["y"], dtype=np.float64)
+    # Build detection arrays, filtered to point sources whose peak is
+    # significantly above local background.  This removes noise
+    # detections and dome/cloud artifacts that would mislead the
+    # pattern match with false correspondences.
+    pm_det_x_raw = np.asarray(det_table["x"], dtype=np.float64)
+    pm_det_y_raw = np.asarray(det_table["y"], dtype=np.float64)
+    pm_peak_raw = np.asarray(det_table["peak"], dtype=np.float64)
+
+    bright_mask = np.zeros(len(pm_det_x_raw), dtype=bool)
+    edge_r = 7
+    for j in range(len(pm_det_x_raw)):
+        xi = int(round(pm_det_x_raw[j]))
+        yi = int(round(pm_det_y_raw[j]))
+        if (xi - edge_r < 0 or xi + edge_r >= nx or
+                yi - edge_r < 0 or yi + edge_r >= ny):
+            continue
+        peak_val = float(image[yi, xi])
+        edge_box = image[yi - edge_r:yi + edge_r + 1,
+                         xi - edge_r:xi + edge_r + 1]
+        edge_mask_arr = np.ones(edge_box.shape, dtype=bool)
+        edge_mask_arr[2:-2, 2:-2] = False
+        local_bg_val = float(np.median(edge_box[edge_mask_arr]))
+        if peak_val - local_bg_val >= min_peak_offset:
+            bright_mask[j] = True
+
+    bright_idx = np.where(bright_mask)[0]
+    bright_order = np.argsort(-pm_peak_raw[bright_idx])
+    bright_idx = bright_idx[bright_order]
+
+    pm_det_x = pm_det_x_raw[bright_idx]
+    pm_det_y = pm_det_y_raw[bright_idx]
+    if verbose:
+        log.info(f"  Point-source detections: {len(pm_det_x)} / "
+                 f"{len(pm_det_x_raw)}")
+
+    # Moon exclusion: if moon is above horizon, find the brightest
+    # extended region (heavy Gaussian blur) and exclude detections near it.
+    if meta is not None and len(pm_det_x) >= 5:
+        try:
+            from astropy.coordinates import get_body, EarthLocation, AltAz
+            import astropy.units as u
+            _loc = EarthLocation(
+                lat=meta["lat_deg"] * u.deg,
+                lon=meta["lon_deg"] * u.deg)
+            _frame = AltAz(obstime=meta["obs_time"], location=_loc)
+            _moon = get_body("moon", meta["obs_time"],
+                             _loc).transform_to(_frame)
+            if float(_moon.alt.deg) > 5:
+                from scipy.ndimage import gaussian_filter as _gf_moon
+                _smoothed = _gf_moon(image.astype(np.float64), sigma=20)
+                myi, mxi = np.unravel_index(
+                    np.argmax(_smoothed), _smoothed.shape)
+                moon_x, moon_y = float(mxi), float(myi)
+                excl_r = max(100, 0.15 * np.sqrt(nx**2 + ny**2))
+                dist_sq = ((pm_det_x - moon_x)**2 +
+                           (pm_det_y - moon_y)**2)
+                keep = dist_sq > excl_r**2
+                n_excl = int(np.sum(~keep))
+                if n_excl > 0:
+                    pm_det_x = pm_det_x[keep]
+                    pm_det_y = pm_det_y[keep]
+                    if verbose:
+                        log.info(f"  Moon (alt={float(_moon.alt.deg):.0f}°) "
+                                 f"— excluded {n_excl} detections near "
+                                 f"({moon_x:.0f}, {moon_y:.0f})")
+        except Exception:
+            pass
 
     # Try multiple f_range windows centered on the horizon-implied f.
     # For an all-sky camera, the horizon constrains f tightly:
@@ -2590,6 +2692,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                 det_x_use, pm_det_y, cat_az, cat_alt, vmag_ext,
                 cx=cx_est, cy=cy_est, nx=nx, ny=ny,
                 f_range=fr, n_bright_det=n_anchor, verbose=False,
+                alt0_range=alt0_range_deg,
             )
             if m is not None and n >= 10:
                 # Tag mirrored candidates so we know to flip later
@@ -2609,6 +2712,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                     cx=cx_est, cy=cy_est, nx=nx, ny=ny,
                     f_range=fr, n_bright_det=n_anchor, verbose=False,
                     rho_hint=rho_density,
+                    alt0_range=alt0_range_deg,
                 )
                 if m is not None and n >= 10:
                     dd["_mirrored"] = (label == "mirror")
@@ -2636,7 +2740,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         # If best candidate came from mirrored pass, flip the image
         # and detection table so all subsequent processing uses the
         # correct orientation.
-        if pm_diag.get("_mirrored", False):
+        if pm_diag.get("_mirrored", False) and pm_n >= 30:
             is_mirrored = True
             image = image[:, ::-1]  # flip x-axis
             # Update detection table x-coordinates
@@ -3096,6 +3200,186 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                      f"f={mf_b.f:.0f}")
             log.info(f"    det:  {nf_d} matches, RMS={rmsf_d:.1f}, "
                      f"f={mf_d.f:.0f}")
+
+    # --- Step 6c: Score-map sweep backup ---
+    # When the pattern-match pipeline couldn't solve the camera (weak
+    # result), try an independent path: score-map parameter sweep →
+    # altitude-descent f/k1 → full refinement.  This catches cameras
+    # like Liverpool where DAOStarFinder detections are too sparse for
+    # the pattern match but the raw image has detectable stars.
+    if hc_n >= 20:
+        if verbose:
+            log.info("Step 6c: Score-map sweep backup")
+
+        from scipy.ndimage import gaussian_filter as _gf
+        from scipy.ndimage import maximum_filter as _xf
+        _img = image.astype(np.float64)
+        _bg_map = _gf(_img, sigma=25.0)
+        _contrast = _img - _bg_map
+        _star_mask = (_contrast > min_peak_offset * 0.5).astype(np.float64)
+        _star_dilated = _xf(_star_mask, size=11)
+        wide_score_map = _gf(_star_dilated, sigma=6.0)
+
+        # Moon exclusion: if moon is up, mask the smoothed image
+        # around the brightest extended region before sweeping.
+        moon_excl_x, moon_excl_y = None, None
+        if meta is not None:
+            try:
+                from astropy.coordinates import get_body, EarthLocation, AltAz
+                import astropy.units as u
+                _loc = EarthLocation(
+                    lat=meta["lat_deg"] * u.deg,
+                    lon=meta["lon_deg"] * u.deg)
+                _frame = AltAz(obstime=meta["obs_time"], location=_loc)
+                _moon = get_body("moon", meta["obs_time"],
+                                 _loc).transform_to(_frame)
+                if float(_moon.alt.deg) > 5:
+                    _smoothed = _gf(_img, sigma=20)
+                    myi, mxi = np.unravel_index(
+                        np.argmax(_smoothed), _smoothed.shape)
+                    moon_excl_x, moon_excl_y = float(mxi), float(myi)
+                    excl_r = max(100, 0.15 * np.sqrt(nx**2 + ny**2))
+                    # Zero out score map near moon
+                    _ys, _xs = np.mgrid[:ny, :nx]
+                    moon_mask = (((_xs - moon_excl_x)**2 +
+                                  (_ys - moon_excl_y)**2) < excl_r**2)
+                    wide_score_map[moon_mask] = 0
+                    if verbose:
+                        log.info(f"  Moon exclusion at "
+                                 f"({moon_excl_x:.0f}, {moon_excl_y:.0f})")
+            except Exception:
+                pass
+
+        f_vals = f_from_horizon * np.array([0.85, 0.92, 1.0, 1.08, 1.15])
+        alt0_vals = np.radians(np.array([87, 88.5, 90, 91.5, 93]))
+        rho_vals = np.radians(np.arange(0, 360, 2))
+
+        sweep_best_score = -1.0
+        sweep_best_rho = 0.0
+        sweep_best_f = f_from_horizon
+        sweep_best_alt0 = np.pi / 2
+
+        for fi in f_vals:
+            for a0 in alt0_vals:
+                for rho in rho_vals:
+                    m = CameraModel(
+                        cx=cx_est, cy=cy_est, az0=0.0, alt0=a0,
+                        rho=rho, f=fi,
+                        proj_type=ProjectionType.EQUIDISTANT,
+                    )
+                    s = score_model(wide_score_map, cat_az, cat_alt,
+                                    vmag_ext, m)
+                    if s > sweep_best_score:
+                        sweep_best_score = s
+                        sweep_best_rho = rho
+                        sweep_best_f = fi
+                        sweep_best_alt0 = a0
+
+        if verbose:
+            log.info(f"  Sweep: rho={np.degrees(sweep_best_rho):.0f}°, "
+                     f"f={sweep_best_f:.0f}, "
+                     f"alt0={np.degrees(sweep_best_alt0):.1f}°")
+
+        # Altitude-descent refinement from sweep
+        sweep_seed = CameraModel(
+            cx=cx_est, cy=cy_est, az0=0.0, alt0=sweep_best_alt0,
+            rho=sweep_best_rho, f=sweep_best_f,
+            proj_type=ProjectionType.EQUIDISTANT,
+        )
+
+        # Phase 1: high-altitude geometry (distortion negligible).
+        # Wide search radius (50px) because the sweep's rho may be
+        # 10-20° off, causing ~30-40px positional errors even at high
+        # altitude.  The first iteration needs to catch these.
+        sw1, n_sw1, rms_sw1 = guided_refine(
+            image, wide_az, wide_alt, sweep_seed,
+            n_iterations=12, min_peak_offset=min_peak_offset,
+            alt_min_deg=60, alt_max_deg=85,
+            fix_az0=True, fit_distortion=False,
+            horizon_r=None, horizon_weight=0.0,
+            initial_search_radius=50,
+        )
+        if n_sw1 >= 5:
+            sweep_seed = sw1
+
+        # Phase 2: mid-altitude with distortion
+        sw2, n_sw2, rms_sw2 = guided_refine(
+            image, wide_az, wide_alt, sweep_seed,
+            n_iterations=15, min_peak_offset=min_peak_offset,
+            alt_min_deg=15, alt_max_deg=75,
+            fix_az0=True, fit_distortion=True,
+            horizon_r=hr, horizon_weight=1.0,
+        )
+        if n_sw2 >= 10:
+            sweep_seed = sw2
+
+        # Phase 3: wide altitude
+        sw3, n_sw3, rms_sw3 = guided_refine(
+            image, wide_az, wide_alt, sweep_seed,
+            n_iterations=15, min_peak_offset=min_peak_offset,
+            alt_min_deg=5, alt_max_deg=88,
+            fix_az0=True, fit_distortion=True,
+            horizon_r=hr, horizon_weight=1.0,
+        )
+        if _is_better(n_sw3, rms_sw3, n_sw2, rms_sw2):
+            sweep_seed = sw3
+
+        # Phase 4: deep guided
+        deep_mask = vmag_ext < 5.5
+        sw4, n_sw4, rms_sw4 = guided_refine(
+            image, cat_az[deep_mask], cat_alt[deep_mask], sweep_seed,
+            n_iterations=15, min_peak_offset=min_peak_offset,
+            alt_min_deg=5, alt_max_deg=88,
+            fix_az0=False, fit_distortion=True,
+            horizon_r=hr, horizon_weight=1.0,
+        )
+        n_sweep_final = n_sw4 if n_sw4 > max(n_sw2, n_sw3) else max(n_sw2, n_sw3)
+        rms_sweep_final = rms_sw4 if n_sw4 > max(n_sw2, n_sw3) else min(rms_sw2, rms_sw3)
+        model_sweep_final = sw4 if n_sw4 > max(n_sw2, n_sw3) else sweep_seed
+
+        if verbose:
+            log.info(f"  Sweep backup: {n_sweep_final} matches, "
+                     f"RMS={rms_sweep_final:.2f}, "
+                     f"f={model_sweep_final.f:.0f}")
+
+        # Compare main pipeline and sweep using bright-star validation,
+        # NOT match count.  The main pipeline can produce false-positive
+        # matches (dome/cloud artifacts) that inflate counts.  Validation
+        # checks whether bright catalog stars have real point sources at
+        # the modeled positions — this catches wrong solutions that
+        # "look good" by match count.
+        def _validate(model_v, label_v):
+            """Fraction of bright in-frame catalog stars with point sources."""
+            bright_v = (vmag_ext < 4.0) & \
+                (cat_alt > np.radians(15)) & (cat_alt < np.radians(80))
+            v_az = cat_az[bright_v]
+            v_alt = cat_alt[bright_v]
+            v_matches = _guided_match(
+                image, model_v, v_az, v_alt,
+                search_radius=8,
+                min_peak=background + min_peak_offset,
+                background=background,
+            )
+            vx, vy = model_v.sky_to_pixel(v_az, v_alt)
+            in_frame = ((vx > 20) & (vx < nx - 20) &
+                        (vy > 20) & (vy < ny - 20))
+            n_if = int(np.sum(in_frame))
+            frac = len(v_matches) / n_if if n_if > 0 else 0.0
+            if verbose:
+                log.info(f"  Validation {label_v}: "
+                         f"{len(v_matches)}/{n_if} = {frac:.0%}")
+            return frac
+
+        main_val = _validate(best_model, "main")
+        sweep_val = _validate(model_sweep_final, "sweep")
+
+        if sweep_val > main_val and n_sweep_final >= 30:
+            if verbose:
+                log.info(f"  Sweep backup wins by validation "
+                         f"({sweep_val:.0%} vs {main_val:.0%})")
+            best_model = model_sweep_final
+            best_n = n_sweep_final
+            best_rms = rms_sweep_final
 
     # --- Step 7: Residual diagnostics ---
     if verbose:

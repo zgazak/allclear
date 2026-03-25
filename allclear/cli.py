@@ -286,6 +286,7 @@ def cmd_instrument_fit(args):
 
         model, n_matched, rms, diag = instrument_fit_pipeline(
             data, det, cat, initial_f=initial_f, verbose=args.verbose,
+            meta=meta,
         )
 
         # Quality gate — scale RMS limit with image size since coarser
@@ -407,9 +408,12 @@ def cmd_instrument_fit(args):
         print(f"  Diagnostic plot: {args.diagnostic_plot}")
 
     # Save annotated image using guided matches from best frame
-    plot_path = pathlib.Path(args.output).stem + "_solved.png"
+    plot_path = str(pathlib.Path(args.output).with_suffix('')) + "_solved.png"
+    plot_data_solved = best["data"]
+    if best["diag"].get("mirrored", False):
+        plot_data_solved = plot_data_solved[:, ::-1]
     _save_annotated_image(
-        best["data"], model, best["fit_det"], best["cat"], plot_path,
+        plot_data_solved, model, best["fit_det"], best["cat"], plot_path,
         matched_pairs=best["fit_pairs"],
         obs_time=best["meta"]["obs_time"],
         lat=lat, lon=lon)
