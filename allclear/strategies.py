@@ -2422,7 +2422,7 @@ def pixel_brightness_grid_search(image, cat_az, cat_alt, cx, cy,
 
 
 def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
-                            verbose=False, meta=None):
+                            verbose=False, meta=None, progress=None):
     """Full instrument characterization pipeline.
 
     Pipeline strategy:
@@ -2537,6 +2537,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         log.info(f"  Horizon circle: center=({hc_cx:.0f}, {hc_cy:.0f}), "
                  f"R={hc_R:.0f}, n={hc_n}")
         log.info(f"  Implied f (equidistant): {f_from_horizon:.0f}")
+    if progress:
+        progress("horizon", cx=hc_cx, cy=hc_cy, radius=hc_R,
+                 n_points=hc_n, f_implied=f_from_horizon)
 
     # --- Step 1b: Density-based rotation estimate ---
     # The Milky Way creates a strong azimuthal density signal in both
@@ -2576,6 +2579,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                 if verbose:
                     log.info(f"Step 1b: Density rotation estimate: "
                              f"rho={np.degrees(rho_density):.0f}°")
+                if progress:
+                    progress("rotation",
+                             rho_deg=float(np.degrees(rho_density)))
 
     # --- Step 2: Blind pattern-matching solve ---
     # This replaces the old compact-arc + guided-refine approach.
@@ -2618,6 +2624,8 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     if verbose:
         log.info(f"  Point-source detections: {len(pm_det_x)} / "
                  f"{len(pm_det_x_raw)}")
+    if progress:
+        progress("pattern_match_start", n_detections=len(pm_det_x))
 
     # Moon exclusion: if moon is above horizon, find the brightest
     # extended region (heavy Gaussian blur) and exclude detections near it.
@@ -2649,6 +2657,11 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                         log.info(f"  Moon (alt={float(_moon.alt.deg):.0f}°) "
                                  f"— excluded {n_excl} detections near "
                                  f"({moon_x:.0f}, {moon_y:.0f})")
+                    if progress:
+                        progress("moon_excluded",
+                                 alt_deg=float(_moon.alt.deg),
+                                 n_excluded=n_excl,
+                                 x=moon_x, y=moon_y)
         except Exception:
             pass
 
@@ -2701,6 +2714,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                 if verbose:
                     log.info(f"  {label} f_range {fr[0]:.0f}-{fr[1]:.0f}: "
                              f"{n} matches, RMS={r:.1f}, f={m.f:.0f}")
+                if progress:
+                    progress("pattern_match_candidate",
+                             orientation=label, n_matches=n,
+                             rms=r, f=m.f)
 
     # Also run with density-derived rho hint (both orientations).
     if rho_density is not None:
@@ -2756,6 +2773,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     if verbose:
         log.info(f"  Best after Step 2: {pm_n} matches, RMS={pm_rms:.1f}"
                  f"{' (mirrored)' if is_mirrored else ''}")
+    if progress:
+        progress("pattern_match_done", n_matches=pm_n, rms=pm_rms,
+                 f=pm_model.f if pm_model else 0, mirrored=is_mirrored)
 
     if pm_model is not None and pm_n >= 10:
         best_model = pm_model
@@ -3024,6 +3044,8 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     # downweighted by soft_l1 loss with f_scale=5).
     if verbose:
         log.info("Step 6: Joint geometry + distortion refinement")
+    if progress:
+        progress("refine_start")
 
     # Phase A: Joint fit from analytical seed, mid-altitude
     m6a, n6a, rms6a = guided_refine(
@@ -3041,6 +3063,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         log.info(f"  Phase A (mid-alt): {n6a} matches, RMS={rms6a:.1f}, "
                  f"f={m6a.f:.0f}, k1={m6a.k1:.2e}, "
                  f"horizon={r_h:.0f}px")
+    if progress:
+        progress("refine_phase", phase="A", n_matches=n6a,
+                 rms=rms6a, f=m6a.f)
 
     # Phase B: Broaden to include low-altitude stars
     m6b, n6b, rms6b = guided_refine(
@@ -3058,6 +3083,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         log.info(f"  Phase B (wide): {n6b} matches, RMS={rms6b:.1f}, "
                  f"f={m6b.f:.0f}, k1={m6b.k1:.2e}, "
                  f"horizon={r_h:.0f}px")
+    if progress:
+        progress("refine_phase", phase="B", n_matches=n6b,
+                 rms=rms6b, f=m6b.f)
 
     # Phase C: Full-field final refinement
     m6c, n6c, rms6c = guided_refine(
@@ -3075,6 +3103,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         log.info(f"  Phase C (full-field): {n6c} matches, RMS={rms6c:.1f}, "
                  f"f={m6c.f:.0f}, k1={m6c.k1:.2e}, "
                  f"horizon={r_h:.0f}px")
+    if progress:
+        progress("refine_phase", phase="C", n_matches=n6c,
+                 rms=rms6c, f=m6c.f)
 
     # Pick the best of Phases A/B/C
     for m_cand, n_cand, rms_cand in [(m6a, n6a, rms6a), (m6b, n6b, rms6b),
@@ -3101,6 +3132,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         log.info(f"  Phase D (full catalog det): {n6d} matches, RMS={rms6d:.1f}, "
                  f"f={m6d.f:.0f}, k1={m6d.k1:.2e}, "
                  f"horizon={r_h:.0f}px")
+    if progress:
+        progress("refine_phase", phase="D", n_matches=n6d,
+                 rms=rms6d, f=m6d.f)
 
     if _is_better(n6d, rms6d, best_n, best_rms):
         best_model = m6d
@@ -3132,12 +3166,19 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         log.info(f"  Phase E (full guided): {n6e} matches, RMS={rms6e:.1f}, "
                  f"f={m6e.f:.0f}, k1={m6e.k1:.2e}, "
                  f"horizon={r_h:.0f}px")
+    if progress:
+        progress("refine_phase", phase="E", n_matches=n6e,
+                 rms=rms6e, f=m6e.f)
 
     # Only adopt Phase E if RMS didn't degrade significantly
     if n6e > best_n and rms6e <= best_rms * 1.15:
         best_model = m6e
         best_n = n6e
         best_rms = rms6e
+
+    if progress:
+        progress("refine_done", n_matches=best_n, rms=best_rms,
+                 f=best_model.f)
 
     # Phase F: Alternative projection (if Step 5b found one).
     # First stabilize geometry (no distortion), then add distortion.
@@ -3259,6 +3300,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         sweep_best_f = f_from_horizon
         sweep_best_alt0 = np.pi / 2
 
+        n_total_sweep = len(f_vals) * len(alt0_vals) * len(rho_vals)
+        if progress:
+            progress("sweep_start", n_models=n_total_sweep)
+        sweep_count = 0
         for fi in f_vals:
             for a0 in alt0_vals:
                 for rho in rho_vals:
@@ -3274,6 +3319,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                         sweep_best_rho = rho
                         sweep_best_f = fi
                         sweep_best_alt0 = a0
+                    sweep_count += 1
+                    if progress and sweep_count % 200 == 0:
+                        progress("sweep_progress",
+                                 fraction=sweep_count / n_total_sweep)
 
         if verbose:
             log.info(f"  Sweep: rho={np.degrees(sweep_best_rho):.0f}°, "
@@ -3299,6 +3348,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             horizon_r=None, horizon_weight=0.0,
             initial_search_radius=50,
         )
+        if progress:
+            progress("sweep_refine", phase=1, n_matches=n_sw1,
+                     rms=rms_sw1, f=sw1.f)
         if n_sw1 >= 5:
             sweep_seed = sw1
 
@@ -3310,6 +3362,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             fix_az0=True, fit_distortion=True,
             horizon_r=hr, horizon_weight=1.0,
         )
+        if progress:
+            progress("sweep_refine", phase=2, n_matches=n_sw2,
+                     rms=rms_sw2, f=sw2.f)
         if n_sw2 >= 10:
             sweep_seed = sw2
 
@@ -3321,6 +3376,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             fix_az0=True, fit_distortion=True,
             horizon_r=hr, horizon_weight=1.0,
         )
+        if progress:
+            progress("sweep_refine", phase=3, n_matches=n_sw3,
+                     rms=rms_sw3, f=sw3.f)
         if _is_better(n_sw3, rms_sw3, n_sw2, rms_sw2):
             sweep_seed = sw3
 
@@ -3337,6 +3395,11 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         rms_sweep_final = rms_sw4 if n_sw4 > max(n_sw2, n_sw3) else min(rms_sw2, rms_sw3)
         model_sweep_final = sw4 if n_sw4 > max(n_sw2, n_sw3) else sweep_seed
 
+        if progress:
+            progress("sweep_refine", phase=4, n_matches=n_sw4,
+                     rms=rms_sw4, f=sw4.f)
+            progress("sweep_result", n_matches=n_sweep_final,
+                     rms=rms_sweep_final, f=model_sweep_final.f)
         if verbose:
             log.info(f"  Sweep backup: {n_sweep_final} matches, "
                      f"RMS={rms_sweep_final:.2f}, "
@@ -3371,15 +3434,39 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             return frac
 
         main_val = _validate(best_model, "main")
+        main_n_if = int(np.sum(
+            ((lambda vx, vy: (vx > 20) & (vx < nx-20) & (vy > 20) & (vy < ny-20))
+             (*best_model.sky_to_pixel(
+                 cat_az[(vmag_ext < 4.0) & (cat_alt > np.radians(15)) & (cat_alt < np.radians(80))],
+                 cat_alt[(vmag_ext < 4.0) & (cat_alt > np.radians(15)) & (cat_alt < np.radians(80))])))))
         sweep_val = _validate(model_sweep_final, "sweep")
+        sweep_n_if = int(np.sum(
+            ((lambda vx, vy: (vx > 20) & (vx < nx-20) & (vy > 20) & (vy < ny-20))
+             (*model_sweep_final.sky_to_pixel(
+                 cat_az[(vmag_ext < 4.0) & (cat_alt > np.radians(15)) & (cat_alt < np.radians(80))],
+                 cat_alt[(vmag_ext < 4.0) & (cat_alt > np.radians(15)) & (cat_alt < np.radians(80))])))))
 
+        winner = ""
         if sweep_val > main_val and n_sweep_final >= 30:
+            winner = "sweep"
             if verbose:
                 log.info(f"  Sweep backup wins by validation "
                          f"({sweep_val:.0%} vs {main_val:.0%})")
             best_model = model_sweep_final
             best_n = n_sweep_final
             best_rms = rms_sweep_final
+        else:
+            winner = "main"
+
+        if progress:
+            progress("validation",
+                     main_frac=main_val,
+                     main_n=int(main_val * main_n_if),
+                     main_total=main_n_if,
+                     sweep_frac=sweep_val,
+                     sweep_n=int(sweep_val * sweep_n_if),
+                     sweep_total=sweep_n_if,
+                     winner=winner)
 
     # --- Step 7: Residual diagnostics ---
     if verbose:
