@@ -39,6 +39,8 @@ def main(argv=None):
                        help="Initial focal length guess (pixels)")
     p_fit.add_argument("--verbose", action="store_true",
                        help="Print detailed progress")
+    p_fit.add_argument("--dashboard", action="store_true",
+                       help="Show live progress dashboard")
     p_fit.add_argument("--diagnostic-plot", type=str, default=None,
                        help="Save diagnostic plot to this path")
 
@@ -278,15 +280,24 @@ def cmd_instrument_fit(args):
             initial_f = args.focal
 
         ny, nx = data.shape
-        print(f"  Image: {nx}x{ny}")
-        print(f"  Obs time: {meta['obs_time'].iso}")
-        print(f"  Catalog stars: {len(cat)}")
-        print(f"  Detected sources: {len(det)}")
-        print(f"  Initial f estimate: {initial_f:.0f} px")
+        if not args.dashboard:
+            print(f"  Image: {nx}x{ny}")
+            print(f"  Obs time: {meta['obs_time'].iso}")
+            print(f"  Catalog stars: {len(cat)}")
+            print(f"  Detected sources: {len(det)}")
+            print(f"  Initial f estimate: {initial_f:.0f} px")
+
+        # Set up dashboard progress display
+        progress_cb = None
+        if args.dashboard:
+            from .progress import ProgressDisplay
+            progress_cb = ProgressDisplay()
+            progress_cb("start", nx=nx, ny=ny, obs_time=meta["obs_time"],
+                        n_cat=len(cat), n_det=len(det))
 
         model, n_matched, rms, diag = instrument_fit_pipeline(
             data, det, cat, initial_f=initial_f, verbose=args.verbose,
-            meta=meta,
+            meta=meta, progress=progress_cb,
         )
 
         # Quality gate — scale RMS limit with image size since coarser
