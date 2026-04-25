@@ -58,7 +58,7 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
                matched_pairs=None, show_grid=True, transmission_data=None,
                obs_time=None, lat_deg=None, lon_deg=None,
                output_path=None, dpi=None, horizon_r=None,
-               horizon_center=None):
+               horizon_center=None, obscuration=None):
     """Render an annotated all-sky camera frame.
 
     Parameters
@@ -70,7 +70,7 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
     det_table : Table, optional
         Detected sources (columns: x, y, flux).
     cat_table : Table, optional
-        Catalog stars (columns: az_deg, alt_deg, vmag_extinct).
+        Catalog stars (columns: az_deg, alt_deg, vmag_expected).
     matched_pairs : list of (det_idx, cat_idx), optional
         Matched detection-catalog pairs.  Shown as thin green circles
         at catalog projected positions, sized by magnitude.
@@ -114,6 +114,12 @@ def plot_frame(image, camera_model, det_table=None, cat_table=None,
         trans_az, trans_alt, trans_vals = transmission_data
         _overlay_transmission(ax, camera_model, trans_az, trans_alt,
                               trans_vals, nx, ny)
+
+    # Obscuration overlay — mark persistently-blocked pixels with a
+    # distinct hatch pattern so occluded sky is visibly different from
+    # cloudy sky.
+    if obscuration is not None:
+        _overlay_obscuration(ax, camera_model, obscuration, nx, ny)
 
     # Az/Alt grid
     if show_grid:
@@ -310,7 +316,7 @@ def _draw_stars(ax, det_table, cat_table, matched_pairs, camera_model,
     det_table : Table or None
         Detected sources with x, y, flux columns.
     cat_table : Table or None
-        Catalog stars with az_deg, alt_deg, vmag_extinct columns.
+        Catalog stars with az_deg, alt_deg, vmag_expected columns.
     matched_pairs : list of (det_idx, cat_idx) or None
     camera_model : CameraModel
     nx, ny : int
@@ -335,7 +341,7 @@ def _draw_stars(ax, det_table, cat_table, matched_pairs, camera_model,
                     continue
 
             matched_cat.add(ci)
-            vmag = float(cat_table["vmag_extinct"][ci])
+            vmag = float(cat_table["vmag_expected"][ci])
             radius = max(3, int(12 - 1.5 * vmag))
             lw = max(0.6, 1.5 - 0.15 * vmag)
 
@@ -365,14 +371,14 @@ def _draw_stars(ax, det_table, cat_table, matched_pairs, camera_model,
                 )
                 ax.add_patch(circle)
 
-    # Unmatched catalog stars — blue circles for the brightest 100
-    # in-frame stars not already shown as matched
+    # Unmatched catalog stars — red circles for all bright in-frame
+    # catalog stars not already shown as matched
     if cat_table is not None and camera_model is not None:
-        vmag_all = np.array(cat_table["vmag_extinct"], dtype=np.float64)
+        vmag_all = np.array(cat_table["vmag_expected"], dtype=np.float64)
         order = np.argsort(vmag_all)
         n_shown = 0
         for i in order:
-            if n_shown >= 200:
+            if n_shown >= 2000:
                 break
             if i in matched_cat:
                 continue
@@ -461,6 +467,37 @@ def _overlay_transmission(ax, camera_model, trans_az, trans_alt, trans_vals,
         trans_img, cmap="RdYlGn", alpha=0.55, origin="lower",
         extent=[0, nx, 0, ny], vmin=0, vmax=1.2,
         interpolation="bilinear",
+    )
+
+
+def _overlay_obscuration(ax, camera_model, obscuration, nx, ny,
+                         threshold=0.3, step=8, color="#5555aa", alpha=0.55):
+    """Hatch-shade pixels whose sky direction is persistently obscured.
+
+    Projects the sky-space mask onto a coarsened pixel grid and draws
+    a solid semi-transparent overlay so "occluded" is visually distinct
+    from "cloudy" (green-to-red) in the transmission rendering.
+    """
+    yy, xx = np.mgrid[0:ny:step, 0:nx:step]
+    w = obscuration.project_to_pixel(
+        camera_model, image_shape=(ny, nx))
+    # Downsample to the coarse grid
+    w_small = w[::step, ::step]
+    mask = w_small < threshold
+
+    if not mask.any():
+        return
+
+    # Build RGBA image: transparent where visible, semi-opaque color
+    # where obscured
+    rgba = np.zeros(mask.shape + (4,), dtype=np.float32)
+    r, g, b = [int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+    rgba[mask] = (r, g, b, alpha)
+
+    ax.imshow(
+        rgba, origin="lower",
+        extent=[0, nx, 0, ny],
+        interpolation="nearest",
     )
 
 
@@ -681,3 +718,4 @@ def plot_residuals(det_table, cat_table, matched_pairs, camera_model,
         return None
     else:
         return fig, (ax1, ax2)
+

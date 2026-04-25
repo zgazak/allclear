@@ -10,7 +10,7 @@ from astropy.table import Table
 from astropy.time import Time
 import astropy.units as u
 
-from .utils import airmass_bemporad, extinction_correction
+from .utils import airmass_bemporad, expected_apparent_mag
 
 DATA_DIR = pathlib.Path(__file__).parent / "data"
 CATALOG_PATH = DATA_DIR / "hipparcos_bright.ecsv"
@@ -139,7 +139,7 @@ class BrightStarCatalog:
         return out
 
     def get_visible_stars(self, lat_deg, lon_deg, obs_time, alt_limit=5.0,
-                          extinction_k=0.20):
+                          response_k=0.20):
         """Return catalog stars visible from the given location and time.
 
         Parameters
@@ -150,14 +150,18 @@ class BrightStarCatalog:
             Observation time.
         alt_limit : float
             Minimum altitude in degrees.
-        extinction_k : float
-            Atmospheric extinction coefficient.
+        response_k : float
+            Default effective response slope (mag/airmass) used to
+            predict expected apparent magnitudes when no per-instrument
+            response calibration is available.  Bundles nominal
+            atmospheric extinction with zenith-angle-dependent
+            throughput rolloff (vignetting, projection Jacobian).
 
         Returns
         -------
         astropy.table.Table
             Columns: hip_id, ra_deg, dec_deg, vmag, az_deg, alt_deg,
-            airmass, vmag_extinct
+            airmass, vmag_expected
         """
         cat = self.table
         location = EarthLocation(lat=lat_deg * u.deg, lon=lon_deg * u.deg,
@@ -182,10 +186,10 @@ class BrightStarCatalog:
         out["az_deg"] = az_deg_arr[mask]
         out["alt_deg"] = alt_deg_arr[mask]
         out["airmass"] = airmass_bemporad(np.radians(alt_deg_arr[mask]))
-        out["vmag_extinct"] = extinction_correction(
-            out["vmag"], out["airmass"], k=extinction_k
+        out["vmag_expected"] = expected_apparent_mag(
+            out["vmag"], out["airmass"], k=response_k
         )
 
         # Sort by apparent brightness (brightest first)
-        out.sort("vmag_extinct")
+        out.sort("vmag_expected")
         return out

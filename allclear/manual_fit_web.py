@@ -155,7 +155,7 @@ class ManualFitWeb:
             cat_alt = np.radians(
                 np.asarray(self.cat_table["alt_deg"], dtype=np.float64))
             cat_x, cat_y = self.model.sky_to_pixel(cat_az, cat_alt)
-            vmag = np.asarray(self.cat_table["vmag_extinct"], dtype=np.float64)
+            vmag = np.asarray(self.cat_table["vmag_expected"], dtype=np.float64)
 
             # Sort by brightness and limit to 500
             order = np.argsort(vmag)

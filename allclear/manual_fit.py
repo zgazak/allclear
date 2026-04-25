@@ -452,7 +452,7 @@ class ManualFitGUI:
         # Catalog star (red circle)?
         cat_idx = getattr(artist, '_cat_star_idx', None)
         if cat_idx is not None:
-            vmag = float(self.cat_table["vmag_extinct"][cat_idx])
+            vmag = float(self.cat_table["vmag_expected"][cat_idx])
             az_d = float(self.cat_table["az_deg"][cat_idx])
             alt_d = float(self.cat_table["alt_deg"][cat_idx])
             self.pending_cat_idx = cat_idx
@@ -543,7 +543,7 @@ class ManualFitGUI:
             ci = self.pending_cat_idx
             az_rad = np.radians(float(self.cat_table["az_deg"][ci]))
             alt_rad = np.radians(float(self.cat_table["alt_deg"][ci]))
-            vmag = float(self.cat_table["vmag_extinct"][ci])
+            vmag = float(self.cat_table["vmag_expected"][ci])
             star_label = f"v={vmag:.1f}"
             self.pending_cat_idx = None
         else:
@@ -726,7 +726,7 @@ class ManualFitGUI:
             cat_alt = np.radians(
                 np.asarray(self.cat_table["alt_deg"], dtype=np.float64))
             cat_x, cat_y = model.sky_to_pixel(cat_az, cat_alt)
-            vmag = np.asarray(self.cat_table["vmag_extinct"], dtype=np.float64)
+            vmag = np.asarray(self.cat_table["vmag_expected"], dtype=np.float64)
 
             # Store projected positions for click-to-select
             self._cat_px = cat_x

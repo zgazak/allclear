@@ -149,6 +149,68 @@ def _parse_dms(value):
     return sign * deg
 
 
+def write_fits_with_wcs(data, camera_model, obs_time, site_lat, site_lon,
+                        output_path, original_header=None, mirrored=False,
+                        extra_keys=None):
+    """Write a FITS file with WCS header derived from the camera model.
+
+    Parameters
+    ----------
+    data : ndarray
+        2D image array.
+    camera_model : CameraModel
+        Solved camera model.
+    obs_time : astropy.time.Time
+        Observation time.
+    site_lat, site_lon : float
+        Observer latitude / longitude in degrees.
+    output_path : str or Path
+        Output FITS path.
+    original_header : astropy.io.fits.Header, optional
+        Original FITS header to preserve (WCS keys will be updated).
+    mirrored : bool
+        Whether the image was E-W flipped.
+    extra_keys : dict, optional
+        Additional FITS header keywords to add.
+    """
+    ny, nx = data.shape
+    wcs = camera_model.to_wcs(obs_time, site_lat, site_lon, naxis=(nx, ny))
+    wcs_header = wcs.to_header(relax=True)
+
+    if original_header is not None:
+        # Start from original, strip any old WCS, then add ours
+        header = original_header.copy()
+        for key in list(header.keys()):
+            if key.startswith(("CD", "CRPIX", "CRVAL", "CTYPE", "CUNIT",
+                               "A_", "B_", "AP_", "BP_")):
+                del header[key]
+            if key in ("EQUINOX", "RADESYS", "LONPOLE", "LATPOLE",
+                       "A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER"):
+                del header[key]
+    else:
+        header = fits.Header()
+
+    # Merge WCS keywords
+    header.update(wcs_header)
+
+    # AllClear provenance
+    header["ALLCLEAR"] = ("T", "WCS from AllClear camera model")
+    header["AC_PROJ"] = (camera_model.proj_type.value, "AllClear projection type")
+    header["AC_FOCAL"] = (round(camera_model.f, 2), "[px] AllClear focal length")
+    header["AC_K1"] = (camera_model.k1, "AllClear radial distortion k1")
+    header["AC_MIRR"] = (mirrored, "Image is E-W mirrored")
+
+    if extra_keys:
+        for k, v in extra_keys.items():
+            if isinstance(v, tuple):
+                header[k] = v
+            else:
+                header[k] = (v, "")
+
+    hdu = fits.PrimaryHDU(data=data.astype(np.float32), header=header)
+    hdu.writeto(str(output_path), overwrite=True)
+
+
 def altaz_to_direction(az_rad, alt_rad):
     """Convert azimuth/altitude (radians) to unit direction vector (x, y, z).
 
@@ -198,6 +260,13 @@ def airmass_bemporad(alt_rad):
     return float(result) if scalar else result
 
 
-def extinction_correction(vmag, airmass, k=0.20):
-    """Apply atmospheric extinction: m_observed = vmag + k * airmass."""
+def expected_apparent_mag(vmag, airmass, k=0.20):
+    """Predicted apparent magnitude at the current airmass.
+
+    ``m_observed = vmag + k * airmass`` with a default k that bundles
+    a nominal atmospheric extinction together with any zenith-angle
+    dependent throughput rolloff (vignetting, projection Jacobian).
+    See ``allclear/obscuration.py`` for the per-instrument response
+    calibration that supersedes this default once available.
+    """
     return vmag + k * airmass

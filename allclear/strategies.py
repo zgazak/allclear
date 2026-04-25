@@ -934,6 +934,27 @@ def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
             if peak_val - local_bg < min_peak - background:
                 continue
 
+            # Compactness check in bright regions: when the local
+            # background is significantly above the global background
+            # (moonlit clouds, bright nebulosity), structured
+            # backgrounds can mimic point-source contrast.  Require
+            # the peak to drop sharply to its 4 direct neighbors —
+            # real stars have steep gradients; cloud glow is smooth.
+            if local_bg > 1.5 * background:
+                if (abs_x >= 1 and abs_x < nx - 1 and
+                        abs_y >= 1 and abs_y < ny - 1):
+                    neighbors = np.array([
+                        float(image[abs_y - 1, abs_x]),
+                        float(image[abs_y + 1, abs_x]),
+                        float(image[abs_y, abs_x - 1]),
+                        float(image[abs_y, abs_x + 1]),
+                    ], dtype=np.float64)
+                    neighbor_med = float(np.median(neighbors))
+                    drop = peak_val - neighbor_med
+                    noise_local = max(1.0, np.sqrt(abs(neighbor_med)))
+                    if drop / noise_local < 3.0:
+                        continue
+
         det_x = xi - r + cx_c
         det_y = yi - r + cy_c
         matches.append((i, det_x, det_y, float(box[my, mx])))
@@ -2441,7 +2462,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     det_table : Table
         Detected sources (columns: x, y, flux).
     cat_table : Table
-        Visible catalog stars (columns: az_deg, alt_deg, vmag_extinct).
+        Visible catalog stars (columns: az_deg, alt_deg, vmag_expected).
     initial_f : float
         Initial focal length guess in pixels (used as fallback).
     verbose : bool
@@ -2473,7 +2494,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
 
     cat_az_deg = np.asarray(cat_table["az_deg"], dtype=np.float64)
     cat_alt_deg = np.asarray(cat_table["alt_deg"], dtype=np.float64)
-    vmag_ext = np.asarray(cat_table["vmag_extinct"], dtype=np.float64)
+    vmag_ext = np.asarray(cat_table["vmag_expected"], dtype=np.float64)
 
     cat_az = np.radians(cat_az_deg)
     cat_alt = np.radians(cat_alt_deg)
@@ -2750,8 +2771,10 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                              "(f within 35%% of %.0f)",
                              len(consistent), n_pre, f_from_horizon)
 
-        # Pick candidate with best score
-        pm_candidates.sort(key=lambda c: -c[1] / (1.0 + c[2] * c[2]))
+        # Pick candidate with best score.  Weight match count heavily —
+        # for an unrefined blind-solve model, RMS is always high; the
+        # match count is the reliable signal that the solution is correct.
+        pm_candidates.sort(key=lambda c: -c[1] * c[1] / (1.0 + c[2] * c[2]))
         pm_model, pm_n, pm_rms, pm_diag, _ = pm_candidates[0]
 
         # If best candidate came from mirrored pass, flip the image

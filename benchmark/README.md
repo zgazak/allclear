@@ -65,17 +65,61 @@ Each frame has a JSON label in `labels/` following the schema in
   https://github.com/mommermi/cloudynight
 - **Haleakala**: Original data collected by the authors.
 
-## Using with AllClear
+## Reproducing the experiments
+
+Two experiments use ESO APICAM data (public archive, no authentication)
+to evaluate blind-solve robustness and operational tracking.
+
+### Download APICAM experiment data
 
 ```bash
-# Blind-solve a benchmark frame (instrument-fit)
-uv run allclear instrument-fit \
-    --frames benchmark/data/eso_apicam/APICAM.2019-06-15T*.fits \
-    --lat -24.627 --lon -70.405 \
-    --output benchmark/solutions/eso_apicam_model.json
+# Seasonal: one frame per night, Jan-Dec 2019 (~8.6 GB, 260 frames)
+uv run python benchmark/scripts/fetch_apicam_drift_study.py --mode seasonal
 
-# Fast-solve with known model
-uv run allclear solve \
-    --frames "benchmark/data/eso_apicam/*.fits" \
-    --model benchmark/solutions/eso_apicam_model.json
+# Nightly: every frame from one clear night, 2019-06-15 (~8 GB, 244 frames)
+uv run python benchmark/scripts/fetch_apicam_drift_study.py --mode nightly
 ```
+
+### Experiment 1: Yearly blind-fit (260 nights)
+
+Each night's frame is blind-solved from scratch — no reference model,
+no prior geometry. Tests whether the pipeline can cold-start on any
+given night regardless of season, temperature, or weather.
+
+```bash
+uv run python benchmark/scripts/run_seasonal_blind.py \
+    --frames "benchmark/data/apicam_drift_seasonal/*.fits" \
+    --lat -24.6272 --lon -70.4048 \
+    --output benchmark/results/apicam_seasonal_blind \
+    --jobs 12
+```
+
+Produces per-frame model JSONs, a summary CSV, and comparison plots
+in `benchmark/results/apicam_seasonal_blind/`. Clear nights succeed;
+cloudy nights are expected failures.
+
+### Experiment 2: Nightly tracking (244 frames)
+
+Blind-fit the first frame of a clear night, then fast-solve the
+remaining 243 frames using that model. Tests within-night tracking
+as the sky rotates and CCD temperature drops.
+
+```bash
+# Blind-fit the first frame
+uv run allclear instrument-fit \
+    --frames "benchmark/data/apicam_drift_nightly/APICAM.2019-06-15T00:02:*.fits" \
+    --lat -24.6272 --lon -70.4048 \
+    --output benchmark/results/apicam_nightly/model.json
+
+# Solve the rest of the night
+uv run allclear solve \
+    --frames "benchmark/data/apicam_drift_nightly/*.fits" \
+    --model benchmark/results/apicam_nightly/model.json \
+    --output-dir benchmark/results/apicam_nightly/ \
+    --no-plot
+```
+
+In practice, if tonight's blind-fit fails (cloudy, twilight), fall
+back to the last-known-good model from a previous clear night. Camera
+geometry is stable night-to-night — the seasonal experiment confirms
+this.

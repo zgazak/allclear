@@ -308,7 +308,8 @@ def get_sky_transmission(frame, model, *, time=None, threshold=0.7):
     det = detect_stars(data, fwhm=5.0, threshold_sigma=5.0, n_brightest=1000)
 
     # Solve
-    result = fast_solve(data, det, cat, camera, guided=True)
+    result = fast_solve(data, det, cat, camera, guided=True,
+                        obscuration=inst.obscuration)
 
     if result.n_matched < 3:
         # Not enough matches — return empty map with status
@@ -338,6 +339,7 @@ def get_sky_transmission(frame, model, *, time=None, threshold=0.7):
     az, alt, trans, zp = compute_transmission(
         use_det, cat, result.matched_pairs, result.camera_model,
         image=data, reference_zeropoint=ref_zp,
+        obscuration=inst.obscuration,
     )
     tmap = interpolate_transmission(az, alt, trans)
 
