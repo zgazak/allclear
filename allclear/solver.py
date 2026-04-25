@@ -41,9 +41,17 @@ class SolveResult:
     status_detail: str = ""
 
 
+def _solve_quality(n_matched, rms):
+    """Quality score for comparing solve results: higher is better."""
+    if n_matched < 3 or rms > 100:
+        return 0.0
+    return n_matched / (1.0 + rms ** 2)
+
+
 def fast_solve(image, det_table, cat_table, camera_model,
                match_radius=10.0, refine=True, guided=True,
-               refit_rotation=False):
+               refit_rotation=False, fallback_model=None,
+               obscuration=None):
     """Solve a frame using a known camera model.
 
     Uses guided matching (finding bright peaks at projected catalog
@@ -57,7 +65,7 @@ def fast_solve(image, det_table, cat_table, camera_model,
     det_table : Table
         Detected sources (columns: x, y, flux). Used as fallback only.
     cat_table : Table
-        Visible catalog stars (columns: az_deg, alt_deg, vmag_extinct).
+        Visible catalog stars (columns: az_deg, alt_deg, vmag_expected).
     camera_model : CameraModel
         Known instrument model.
     match_radius : float
@@ -68,9 +76,13 @@ def fast_solve(image, det_table, cat_table, camera_model,
         If True, use guided matching against pixel data (more robust).
     refit_rotation : bool
         If True, allow wide rotation search when tight solve fails.
-        Use for cameras on rotating mounts or platforms that may have
-        been physically moved.  When False (default), only small
-        pointing adjustments are attempted.
+    fallback_model : CameraModel, optional
+        A recent known-good camera model to try if the primary solve
+        looks suspect.
+    obscuration : ObscurationMask, optional
+        Sky-coordinate mask of persistent obscurations.  Catalog stars
+        falling into masked sky are excluded from matching so the
+        solver does not fight dome / tree / dead-column structure.
 
     Returns
     -------
@@ -79,7 +91,15 @@ def fast_solve(image, det_table, cat_table, camera_model,
     ny, nx = image.shape
     cat_az = np.radians(np.asarray(cat_table["az_deg"], dtype=np.float64))
     cat_alt = np.radians(np.asarray(cat_table["alt_deg"], dtype=np.float64))
-    vmag = np.asarray(cat_table["vmag_extinct"], dtype=np.float64)
+    vmag = np.asarray(cat_table["vmag_expected"], dtype=np.float64)
+
+    if obscuration is not None:
+        visible_mask = obscuration.is_visible(
+            np.asarray(cat_table["az_deg"], dtype=np.float64),
+            np.asarray(cat_table["alt_deg"], dtype=np.float64),
+        )
+    else:
+        visible_mask = np.ones(len(cat_az), dtype=bool)
 
     model = CameraModel(
         cx=camera_model.cx, cy=camera_model.cy,
@@ -89,21 +109,22 @@ def fast_solve(image, det_table, cat_table, camera_model,
         k1=camera_model.k1, k2=camera_model.k2,
     )
 
-    # Count expected in-frame stars
+    # Count expected in-frame stars (exclude obscured sky)
     cat_x, cat_y = model.sky_to_pixel(cat_az, cat_alt)
     in_frame = (np.isfinite(cat_x) & np.isfinite(cat_y)
                 & (cat_x >= 0) & (cat_x < nx)
                 & (cat_y >= 0) & (cat_y < ny)
-                & (vmag < 7.0))
+                & (vmag < 7.0)
+                & visible_mask)
     n_expected = int(np.sum(in_frame))
 
     # --- Guided matching against pixel data ---
     background = float(np.median(image))
 
     # Use deep catalog for guided matching (same depth as instrument-fit)
-    bright_mask = vmag < 7.0
+    bright_mask = (vmag < 7.0) & visible_mask
     if np.sum(bright_mask) < 20:
-        bright_mask = vmag < 8.0
+        bright_mask = (vmag < 8.0) & visible_mask
     bright_idx = np.where(bright_mask)[0]
     bright_az = cat_az[bright_mask]
     bright_alt = cat_alt[bright_mask]
@@ -250,17 +271,77 @@ def fast_solve(image, det_table, cat_table, camera_model,
                 model = refined
                 matches = refined_matches
 
-    # Final neighborhood-verified match: confirm each match by checking
-    # that its catalog neighbors also have detectable peaks.  This rejects
-    # wrong-star matches in dense fields (Milky Way).
-    verified = _neighborhood_verified_match(
-        image, model, bright_az, bright_alt, vmag[bright_mask],
-        search_radius=max(3, min(5, int(match_radius))),
-        min_peak=min_peak, background=background,
-        n_neighbors=3, confirm_radius=5, min_confirmed=2,
-    )
-    if len(verified) >= 10:
-        matches = verified
+    # Quality filtering: reject wrong-star matches using local offset
+    # consistency.  Bootstrap a tight core from the best residuals,
+    # then accept matches whose offset matches the local pattern.
+    # This replaces rigid neighborhood verification which fails on
+    # partly-cloudy frames (neighbors behind clouds can't be matched).
+    if len(matches) >= 20:
+        m_dx = np.array([m[1] for m in matches])
+        m_dy = np.array([m[2] for m in matches])
+        m_az = np.array([bright_az[m[0]] for m in matches])
+        m_alt = np.array([bright_alt[m[0]] for m in matches])
+        m_px, m_py = model.sky_to_pixel(m_az, m_alt)
+        m_resid = np.sqrt((m_px - m_dx)**2 + (m_py - m_dy)**2)
+
+        # Core: tightest 30% of residuals (most reliable matches)
+        p30 = float(np.percentile(m_resid, 30))
+        core = [m for m, r in zip(matches, m_resid) if r <= p30]
+        rest = [m for m, r in zip(matches, m_resid) if r > p30]
+
+        # Filter remaining matches by offset consistency with core
+        filtered = _recover_consistent_matches(
+            core, rest, model, bright_az, bright_alt)
+        log.info("Offset-consistency filter: %d core + %d accepted "
+                 "of %d candidates = %d total (from %d guided)",
+                 len(core), len(filtered) - len(core), len(rest),
+                 len(filtered), len(matches))
+
+        # Re-refine model with filtered set
+        if len(filtered) >= _MIN_MATCHES_REFINE:
+            f_dx = np.array([m[1] for m in filtered])
+            f_dy = np.array([m[2] for m in filtered])
+            f_az = np.array([bright_az[m[0]] for m in filtered])
+            f_alt = np.array([bright_alt[m[0]] for m in filtered])
+            f_px, f_py = model.sky_to_pixel(f_az, f_alt)
+            f_resid = np.sqrt((f_px - f_dx)**2 + (f_py - f_dy)**2)
+            good = f_resid < max(8.0,
+                                 np.median(f_resid) + 2.5*np.std(f_resid))
+            if np.sum(good) >= _MIN_MATCHES_REFINE:
+                model = _refine_pointing(
+                    model, f_dx[good], f_dy[good],
+                    f_az[good], f_alt[good])
+
+        # Flood-fill for stars beyond initial match radius
+        expanded, model = _flood_fill_match(
+            image, model, bright_az, bright_alt,
+            core_matches=filtered,
+            min_peak=min_peak, background=background,
+        )
+        matches = expanded
+
+        # Distortion refit: when we have many matches (mostly clear sky),
+        # refit k1 to absorb thermal/mechanical changes to the optics.
+        if len(matches) >= 500:
+            m_dx = np.array([m[1] for m in matches])
+            m_dy = np.array([m[2] for m in matches])
+            m_az = np.array([bright_az[m[0]] for m in matches])
+            m_alt = np.array([bright_alt[m[0]] for m in matches])
+            px_pre, py_pre = model.sky_to_pixel(m_az, m_alt)
+            resid = np.sqrt((px_pre - m_dx)**2 + (py_pre - m_dy)**2)
+            good = resid < max(8.0, np.median(resid) + 2.5*np.std(resid))
+            if np.sum(good) >= 200:
+                refit = _refine_pointing(
+                    model, m_dx[good], m_dy[good],
+                    m_az[good], m_alt[good],
+                    fit_distortion=True)
+                # Re-match with refit model to check improvement
+                refit_matches = _guided_match(
+                    image, refit, bright_az, bright_alt,
+                    search_radius=int(match_radius),
+                    min_peak=min_peak, background=background)
+                if len(refit_matches) >= len(matches) * 0.9:
+                    model = refit
 
     # Build matched pairs (det_idx, cat_idx) using catalog indices
     # and a synthetic detection table from guided-match centroids
@@ -327,7 +408,7 @@ def fast_solve(image, det_table, cat_table, camera_model,
                               "scatter. Camera may have shifted — "
                               "consider re-running instrument-fit.")
 
-    return SolveResult(
+    primary_result = SolveResult(
         camera_model=model,
         matched_pairs=matched_pairs,
         rms_residual=rms,
@@ -338,6 +419,31 @@ def fast_solve(image, det_table, cat_table, camera_model,
         status=status,
         status_detail=detail,
     )
+
+    # --- Fallback: retry with a recent known-good model ---
+    if fallback_model is not None:
+        primary_q = _solve_quality(n_matched, rms)
+        # Heuristic: suspect if RMS > 5 px or match fraction < 10%
+        suspect = rms > 5.0 or match_frac < 0.10
+        if suspect:
+            log.info("Primary solve suspect (rms=%.1f, frac=%.0f%%) — "
+                     "retrying with fallback model", rms, match_frac * 100)
+            fallback_result = fast_solve(
+                image, det_table, cat_table, fallback_model,
+                match_radius=match_radius, refine=refine, guided=guided,
+                refit_rotation=refit_rotation, fallback_model=None,
+                obscuration=obscuration,
+            )
+            fallback_q = _solve_quality(fallback_result.n_matched,
+                                        fallback_result.rms_residual)
+            if fallback_q > primary_q:
+                log.info("Fallback improved: n=%d rms=%.2f (was n=%d rms=%.2f)",
+                         fallback_result.n_matched,
+                         fallback_result.rms_residual,
+                         n_matched, rms)
+                return fallback_result
+
+    return primary_result
 
 
 def _find_rotation_offset(image, model, cat_az, cat_alt, background,
@@ -450,8 +556,9 @@ def _find_rotation_offset(image, model, cat_az, cat_alt, background,
     return delta_rho
 
 
-def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
-    """Refine pointing offsets.
+def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False,
+                     fit_distortion=False):
+    """Refine pointing offsets, optionally including distortion.
 
     Fits (cx, cy, alt0, combined_rotation, f) with az0 fixed to break
     the near-zenith az0/rho degeneracy.  The combined rotation
@@ -462,14 +569,15 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
     ----------
     wide : bool
         If True, use wider bounds (camera may have been moved/adjusted).
+    fit_distortion : bool
+        If True, also fit k1 (radial distortion). Requires many matches
+        to be well-constrained — use only on clear frames.
     """
     proj_type = model.proj_type
     fixed_az0 = model.az0
 
-    # Parameterize as (cx, cy, alt0, rho, f) with az0 fixed
-    p0 = np.array([
-        model.cx, model.cy, model.alt0, model.rho, model.f,
-    ])
+    # Parameterize as (cx, cy, alt0, rho, f [, k1])
+    p0 = [model.cx, model.cy, model.alt0, model.rho, model.f]
 
     if wide:
         bounds_lo = [
@@ -496,12 +604,21 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
             p0[3] + np.radians(5), p0[4] * 1.01,
         ]
 
+    if fit_distortion:
+        p0.append(model.k1)
+        k1_max = 0.3 / model.f ** 2
+        bounds_lo.append(-k1_max)
+        bounds_hi.append(k1_max * 0.1)
+
+    p0 = np.array(p0)
+
     def residuals(params):
+        k1 = params[5] if fit_distortion else model.k1
         m = CameraModel(
             cx=params[0], cy=params[1], az0=fixed_az0,
             alt0=params[2], rho=params[3], f=params[4],
             proj_type=proj_type,
-            k1=model.k1, k2=model.k2,
+            k1=k1, k2=model.k2,
         )
         px, py = m.sky_to_pixel(cat_az, cat_alt)
         return np.concatenate([px - det_x, py - det_y])
@@ -515,11 +632,14 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False):
     )
 
     params = result.x
+    k1_out = params[5] if fit_distortion else model.k1
+    if fit_distortion:
+        log.info("Distortion refit: k1=%.2e → %.2e", model.k1, k1_out)
     return CameraModel(
         cx=params[0], cy=params[1], az0=fixed_az0,
         alt0=params[2], rho=params[3], f=params[4],
         proj_type=proj_type,
-        k1=model.k1, k2=model.k2,
+        k1=k1_out, k2=model.k2,
     )
 
 
@@ -622,3 +742,294 @@ def _neighborhood_verified_match(image, model, cat_az, cat_alt, cat_vmag,
             verified.append((cat_idx, det_x, det_y, peak_val))
 
     return verified
+
+
+def _recover_consistent_matches(verified, killed, model, cat_az, cat_alt,
+                                 max_offset_dev=None):
+    """Re-evaluate killed matches using local offset consistency.
+
+    Matches killed by neighborhood verification may be correct stars
+    whose catalog neighbors happen to be behind clouds.  Accept a
+    killed match if its (det - pred) offset is close to the local
+    median offset of verified matches.
+
+    Parameters
+    ----------
+    verified : list of (cat_idx, det_x, det_y, peak_val)
+        High-confidence core matches.
+    killed : list of (cat_idx, det_x, det_y, peak_val)
+        Matches rejected by neighborhood verification.
+    max_offset_dev : float
+        Maximum deviation (px) of a killed match's offset from the
+        local median to accept it.
+
+    Returns
+    -------
+    list of (cat_idx, det_x, det_y, peak_val)
+        Verified matches plus accepted killed matches.
+    """
+    from scipy.spatial import KDTree
+
+    if not killed or len(verified) < 5:
+        return list(verified)
+
+    # Compute offsets for verified matches
+    v_cat_idx = np.array([m[0] for m in verified])
+    v_det_x = np.array([m[1] for m in verified])
+    v_det_y = np.array([m[2] for m in verified])
+    v_pred_x, v_pred_y = model.sky_to_pixel(
+        np.array([cat_az[i] for i in v_cat_idx]),
+        np.array([cat_alt[i] for i in v_cat_idx]))
+    v_off_dx = v_det_x - v_pred_x
+    v_off_dy = v_det_y - v_pred_y
+
+    # KDTree of verified detection positions
+    v_tree = KDTree(np.column_stack([v_det_x, v_det_y]))
+
+    result = list(verified)
+    for cat_idx, det_x, det_y, peak_val in killed:
+        # This match's offset from model prediction
+        pred_x, pred_y = model.sky_to_pixel(
+            np.array([cat_az[cat_idx]]), np.array([cat_alt[cat_idx]]))
+        my_dx = det_x - float(pred_x[0])
+        my_dy = det_y - float(pred_y[0])
+
+        # Find nearest verified matches
+        k = min(5, len(verified))
+        dists, idxs = v_tree.query([det_x, det_y], k=k)
+        if np.isscalar(dists):
+            dists = np.array([dists])
+            idxs = np.array([idxs])
+
+        # Local median offset from nearby verified matches
+        local_dx, local_dy = [], []
+        for d, idx in zip(dists, idxs):
+            if d > 200:
+                break
+            local_dx.append(v_off_dx[idx])
+            local_dy.append(v_off_dy[idx])
+
+        if len(local_dx) < 2:
+            continue
+
+        med_dx = float(np.median(local_dx))
+        med_dy = float(np.median(local_dy))
+
+        # Per-match tolerance from local scatter of core neighbors.
+        # Tight model: core neighbors agree closely → tight tolerance.
+        # Drifted model: core neighbors show gradient → wider tolerance.
+        local_scatter = float(np.sqrt(
+            np.std(local_dx) ** 2 + np.std(local_dy) ** 2))
+        tolerance = max(5.0, 3.0 * local_scatter)
+        if max_offset_dev is not None:
+            tolerance = max_offset_dev
+
+        dev = np.sqrt((my_dx - med_dx) ** 2 + (my_dy - med_dy) ** 2)
+        if dev < tolerance:
+            result.append((cat_idx, det_x, det_y, peak_val))
+
+    return result
+
+
+def _flood_fill_match(image, model, cat_az, cat_alt, core_matches,
+                      min_peak, background,
+                      max_rings=5, neighbor_dist_px=100.0,
+                      max_rms_factor=3.0):
+    """Grow matched region outward from a verified core.
+
+    Starting from reliable core matches, iteratively try to match
+    catalog stars near the frontier of already-matched stars.  New
+    matches are accepted only if their det-pred offset is consistent
+    with the local offset pattern of nearby matched stars.
+
+    This is more flexible than neighborhood verification for partly-
+    cloudy frames: it doesn't require a star's catalog neighbors to be
+    detected, only that the star's own offset is consistent with the
+    local model error field.
+
+    Parameters
+    ----------
+    core_matches : list of (cat_idx, det_x, det_y, peak_val)
+        Verified core matches (indices into cat_az/cat_alt).
+    neighbor_dist_px : float
+        Max pixel distance from a matched star for a candidate to be
+        considered in the next ring.
+    max_rms_factor : float
+        Stop if overall RMS exceeds core_rms * max_rms_factor.
+
+    Returns
+    -------
+    expanded : list of (cat_idx, det_x, det_y, peak_val)
+    model : CameraModel (possibly re-refined)
+    """
+    from scipy.spatial import KDTree
+
+    ny, nx = image.shape
+    n_cat = len(cat_az)
+
+    matched = list(core_matches)
+    matched_set = set(m[0] for m in matched)
+
+    def _rms(match_list, mdl):
+        if not match_list:
+            return 999.0
+        d_x = np.array([m[1] for m in match_list])
+        d_y = np.array([m[2] for m in match_list])
+        c_az = np.array([cat_az[m[0]] for m in match_list])
+        c_alt = np.array([cat_alt[m[0]] for m in match_list])
+        px, py = mdl.sky_to_pixel(c_az, c_alt)
+        return float(np.sqrt(np.mean((px - d_x) ** 2 + (py - d_y) ** 2)))
+
+    core_rms = _rms(matched, model)
+    if core_rms > 50.0 or len(matched) < 10:
+        return matched, model
+
+    total_added = 0
+
+    for ring in range(max_rings):
+        # Build KDTree of current matched detection positions
+        m_det_x = np.array([m[1] for m in matched])
+        m_det_y = np.array([m[2] for m in matched])
+        m_tree = KDTree(np.column_stack([m_det_x, m_det_y]))
+
+        # Per-match offsets (det - pred) for local offset interpolation
+        m_az = np.array([cat_az[m[0]] for m in matched])
+        m_alt = np.array([cat_alt[m[0]] for m in matched])
+        m_px, m_py = model.sky_to_pixel(m_az, m_alt)
+        off_dx = m_det_x - m_px
+        off_dy = m_det_y - m_py
+
+        # Project all catalog stars with current model
+        all_px, all_py = model.sky_to_pixel(cat_az, cat_alt)
+
+        # Find unmatched in-frame candidates near the frontier
+        candidates = []
+        cand_shift_x = []
+        cand_shift_y = []
+        cand_accept_r = []
+
+        for i in range(n_cat):
+            if i in matched_set:
+                continue
+            pxi, pyi = all_px[i], all_py[i]
+            if not (np.isfinite(pxi) and np.isfinite(pyi)
+                    and 10 <= pxi < nx - 10 and 10 <= pyi < ny - 10):
+                continue
+
+            k = min(5, len(matched))
+            dists_nn, idxs_nn = m_tree.query([pxi, pyi], k=k)
+            if np.isscalar(dists_nn):
+                dists_nn = np.array([dists_nn])
+                idxs_nn = np.array([idxs_nn])
+
+            if dists_nn[0] > neighbor_dist_px:
+                continue
+
+            # Local median offset from nearby matches
+            local_dx, local_dy = [], []
+            for d, idx in zip(dists_nn, idxs_nn):
+                if d > neighbor_dist_px:
+                    break
+                local_dx.append(off_dx[idx])
+                local_dy.append(off_dy[idx])
+
+            if not local_dx:
+                continue
+
+            med_dx = float(np.median(local_dx))
+            med_dy = float(np.median(local_dy))
+            scatter = float(np.sqrt(
+                np.std(local_dx) ** 2 + np.std(local_dy) ** 2))
+
+            # Shifted prediction: model + local systematic offset
+            candidates.append(i)
+            cand_shift_x.append(float(pxi) + med_dx)
+            cand_shift_y.append(float(pyi) + med_dy)
+            cand_accept_r.append(max(3.0 * max(scatter, core_rms), 8.0))
+
+        if not candidates:
+            break
+
+        # Determine search radius: must cover shift + acceptance margin
+        shifts = np.sqrt(
+            (np.array(cand_shift_x) - all_px[candidates]) ** 2
+            + (np.array(cand_shift_y) - all_py[candidates]) ** 2)
+        p95_shift = float(np.percentile(shifts, 95)) if len(shifts) else 0
+        max_accept = float(np.max(cand_accept_r))
+        search_r = min(int(p95_shift + max_accept + 2), 40)
+        search_r = max(search_r, 5)
+
+        # Batch guided match for all candidates
+        cand_az = np.array([cat_az[i] for i in candidates])
+        cand_alt = np.array([cat_alt[i] for i in candidates])
+        ring_raw = _guided_match(image, model, cand_az, cand_alt,
+                                 search_radius=search_r,
+                                 min_peak=min_peak,
+                                 background=background)
+
+        # Accept matches consistent with local offset pattern
+        new_matches = []
+        for cand_local_idx, det_x, det_y, peak_val in ring_raw:
+            sx = cand_shift_x[cand_local_idx]
+            sy = cand_shift_y[cand_local_idx]
+            resid = np.sqrt((det_x - sx) ** 2 + (det_y - sy) ** 2)
+            if resid < cand_accept_r[cand_local_idx]:
+                orig_idx = candidates[cand_local_idx]
+                new_matches.append((orig_idx, det_x, det_y, peak_val))
+
+        if not new_matches:
+            break
+
+        # Diminishing returns: stop if new matches are negligible
+        if len(new_matches) < max(5, int(len(matched) * 0.02)):
+            # Still add these few matches, then stop
+            for m in new_matches:
+                matched.append(m)
+                matched_set.add(m[0])
+            total_added += len(new_matches)
+            break
+
+        for m in new_matches:
+            matched.append(m)
+            matched_set.add(m[0])
+        total_added += len(new_matches)
+
+        # Re-refine model with expanded match set
+        current_rms = _rms(matched, model)
+        if len(matched) >= _MIN_MATCHES_REFINE:
+            d_x = np.array([m[1] for m in matched])
+            d_y = np.array([m[2] for m in matched])
+            c_az = np.array([cat_az[m[0]] for m in matched])
+            c_alt = np.array([cat_alt[m[0]] for m in matched])
+
+            # Sigma-clip before refinement
+            ppx, ppy = model.sky_to_pixel(c_az, c_alt)
+            resids = np.sqrt((ppx - d_x) ** 2 + (ppy - d_y) ** 2)
+            clip_thresh = max(8.0,
+                              np.median(resids) + 3.0 * np.std(resids))
+            clip = resids < clip_thresh
+
+            if np.sum(clip) >= _MIN_MATCHES_REFINE:
+                refined = _refine_pointing(
+                    model, d_x[clip], d_y[clip],
+                    c_az[clip], c_alt[clip])
+                ref_rms = _rms(matched, refined)
+                if ref_rms <= current_rms * 1.1:
+                    model = refined
+                    current_rms = ref_rms
+
+        # Quality gate: stop if RMS grows excessively relative to core.
+        if current_rms > core_rms * max_rms_factor:
+            log.warning("Flood-fill ring %d: RMS %.2fpx exceeds safety "
+                        "limit, stopping", ring, current_rms)
+            break
+
+        log.info("Flood-fill ring %d: +%d matches (total %d, "
+                 "RMS=%.2fpx)", ring, len(new_matches), len(matched),
+                 current_rms)
+
+    if total_added > 0:
+        log.info("Flood-fill complete: %d → %d matches, RMS %.2fpx",
+                 len(core_matches), len(matched), _rms(matched, model))
+
+    return matched, model

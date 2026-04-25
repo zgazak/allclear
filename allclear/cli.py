@@ -43,6 +43,8 @@ def main(argv=None):
                        help="Show live progress dashboard")
     p_fit.add_argument("--diagnostic-plot", type=str, default=None,
                        help="Save diagnostic plot to this path")
+    p_fit.add_argument("--write-fits", action="store_true",
+                       help="Write calibration frame as FITS with WCS header")
 
     # --- solve ---
     p_solve = subparsers.add_parser(
@@ -68,6 +70,8 @@ def main(argv=None):
                          help="Allow wide rotation search if initial solve "
                               "fails. Use for cameras on rotating mounts or "
                               "platforms that have been physically moved.")
+    p_solve.add_argument("--verbose", "-v", action="store_true",
+                         help="Show detailed solver logging")
 
     # --- check ---
     p_check = subparsers.add_parser(
@@ -89,6 +93,38 @@ def main(argv=None):
                          help="Target name for display")
     p_check.add_argument("--threshold", type=float, default=0.7,
                          help="Clear/cloudy threshold (default 0.7)")
+
+    # --- calibrate ---
+    p_cal = subparsers.add_parser(
+        "calibrate",
+        help="Tier 2 calibration tools (build improvements from many frames)",
+    )
+    cal_sub = p_cal.add_subparsers(dest="calibrate_subcommand", required=True)
+
+    p_cal_obs = cal_sub.add_parser(
+        "obscuration",
+        help="Build persistent obscuration mask from many solved frames",
+    )
+    p_cal_obs.add_argument("--model", type=str, required=True,
+                            help="Instrument model JSON file")
+    p_cal_obs.add_argument("--frames", type=str, required=True,
+                            help="Frame glob (FITS/JPG/PNG/TIFF)")
+    p_cal_obs.add_argument("--output", type=str, default=None,
+                            help="Output path (default: <model>_obscuration.json)")
+    p_cal_obs.add_argument("--clear-gate", type=float, default=0.70,
+                            help="Minimum clear fraction to include a frame")
+    p_cal_obs.add_argument("--min-visits", type=int, default=8,
+                            help="Bins with fewer clear-sky visits are NaN")
+    p_cal_obs.add_argument("--vmag-min", type=float, default=1.5,
+                            help="Exclude saturated bright stars (default 1.5)")
+    p_cal_obs.add_argument("--vmag-max", type=float, default=6.0,
+                            help="Exclude faint stars (default 6.0)")
+    p_cal_obs.add_argument("--az-step", type=float, default=2.0,
+                            help="Azimuth bin size in degrees (default 2.0)")
+    p_cal_obs.add_argument("--alt-step", type=float, default=2.0,
+                            help="Altitude bin size in degrees (default 2.0)")
+    p_cal_obs.add_argument("--verbose", "-v", action="store_true",
+                            help="Per-frame progress output")
 
     # --- manual-fit ---
     p_manual = subparsers.add_parser(
@@ -140,6 +176,9 @@ def main(argv=None):
         return cmd_check(args)
     elif args.command == "manual-fit":
         return cmd_manual_fit(args)
+    elif args.command == "calibrate":
+        if args.calibrate_subcommand == "obscuration":
+            return cmd_calibrate_obscuration(args)
 
 
 def _resolve_frames(pattern):
@@ -418,6 +457,34 @@ def cmd_instrument_fit(args):
             meta=best["meta"])
         print(f"  Diagnostic plot: {args.diagnostic_plot}")
 
+    # Write FITS with WCS header
+    if args.write_fits:
+        from .utils import write_fits_with_wcs
+        fits_out = str(pathlib.Path(args.output).with_suffix('')) + "_solved.fits"
+        # Reload original header if input was FITS
+        orig_hdr = None
+        if best["path"].suffix.lower() in {".fits", ".fit", ".fts"}:
+            from astropy.io import fits as pyfits
+            orig_hdr = pyfits.getheader(str(best["path"]))
+        write_data = best["data"]
+        if best["diag"].get("mirrored", False):
+            write_data = write_data[:, ::-1]
+        write_fits_with_wcs(
+            write_data, model,
+            obs_time=best["meta"]["obs_time"],
+            site_lat=lat, site_lon=lon,
+            output_path=fits_out,
+            original_header=orig_hdr,
+            mirrored=best["diag"].get("mirrored", False),
+            extra_keys={
+                "AC_NSTAR": (n_matched, "AllClear matched stars"),
+                "AC_RMS": (round(rms, 3), "[px] AllClear astrometric RMS"),
+                "AC_ZP": (round(best_zp, 4),
+                          "[mag] AllClear photometric zeropoint"),
+            },
+        )
+        print(f"  Solved FITS: {fits_out}")
+
     # Save annotated image using guided matches from best frame
     plot_path = str(pathlib.Path(args.output).with_suffix('')) + "_solved.png"
     plot_data_solved = best["data"]
@@ -451,6 +518,9 @@ def cmd_solve(args):
     from .instrument import InstrumentModel
     from .solver import fast_solve
     from .transmission import compute_transmission, interpolate_transmission
+
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     model_file = pathlib.Path(args.model)
     if not model_file.exists():
@@ -492,7 +562,8 @@ def cmd_solve(args):
                                                           dtype=np.float64)
 
         result = fast_solve(data, det, cat, camera, guided=True,
-                            refit_rotation=args.refit_rotation)
+                            refit_rotation=args.refit_rotation,
+                            obscuration=inst.obscuration)
 
         status_str = f"  [{i+1}/{len(frames)}] {fpath.name}: "
         status_str += (f"{result.n_matched}/{result.n_expected} matches, "
@@ -506,6 +577,7 @@ def cmd_solve(args):
             az, alt, trans, zp = compute_transmission(
                 use_det, cat, result.matched_pairs, result.camera_model,
                 image=data, reference_zeropoint=ref_zp,
+                obscuration=inst.obscuration,
             )
             tmap = interpolate_transmission(az, alt, trans)
             clear_frac = float(np.nanmean(
@@ -513,27 +585,64 @@ def cmd_solve(args):
             ))
             status_str += f", clear={clear_frac:.0%}"
 
-            # Warn if this frame's zeropoint is better (brighter)
-            # than the calibration reference — suggests clearer sky
-            if ref_zp and ref_zp != 0.0:
-                _, _, _, frame_zp = compute_transmission(
-                    use_det, cat, result.matched_pairs,
-                    result.camera_model, image=data,
+            # Note when the zeropoint was auto-upgraded from frame
+            if ref_zp and ref_zp != 0.0 and zp > ref_zp + 0.15:
+                status_str += (
+                    f"\n    NOTE: using frame zeropoint ({zp:.3f}) — "
+                    f"better than model ({ref_zp:.3f})"
                 )
-                # Larger zeropoint = brighter stars = clearer sky
-                if frame_zp > ref_zp + 0.15:
-                    status_str += (
-                        f"\n    NOTE: frame zeropoint ({frame_zp:.3f}) is "
-                        f"better than model ({ref_zp:.3f}). "
-                        f"Consider re-running instrument-fit with this frame."
-                    )
 
-            if not args.no_plot:
-                if output_dir:
-                    out_base = output_dir / fpath.stem
-                else:
-                    out_base = pathlib.Path(fpath.stem)
+            if output_dir:
+                out_base = output_dir / fpath.stem
+            else:
+                out_base = pathlib.Path(fpath.stem)
 
+            # Per-frame model JSON (lightweight — solved geometry + zeropoint)
+            model_path = str(out_base) + "_model.json"
+            frame_inst = InstrumentModel.from_camera_model(
+                result.camera_model,
+                site_lat=inst.site_lat, site_lon=inst.site_lon,
+                mirrored=inst.mirrored,
+                photometric_zeropoint=zp,
+                n_stars_matched=result.n_matched,
+                n_stars_expected=result.n_expected,
+                rms_residual=result.rms_residual,
+            )
+            frame_inst.save(model_path)
+
+            # FITS output with WCS header
+            formats = {f.strip().lower()
+                       for f in args.format.split(",")}
+            if "fits" in formats:
+                from .utils import write_fits_with_wcs
+                fits_path_out = str(out_base) + "_solved.fits"
+                # Reload original header if input was FITS
+                orig_hdr = None
+                if fpath.suffix.lower() in {".fits", ".fit", ".fts"}:
+                    from astropy.io import fits as pyfits
+                    orig_hdr = pyfits.getheader(str(fpath))
+                write_fits_with_wcs(
+                    data, result.camera_model,
+                    obs_time=meta["obs_time"],
+                    site_lat=inst.site_lat,
+                    site_lon=inst.site_lon,
+                    output_path=fits_path_out,
+                    original_header=orig_hdr,
+                    mirrored=inst.mirrored,
+                    extra_keys={
+                        "AC_NSTAR": (result.n_matched,
+                                     "AllClear matched stars"),
+                        "AC_RMS": (round(result.rms_residual, 3),
+                                   "[px] AllClear astrometric RMS"),
+                        "AC_CLEAR": (round(clear_frac, 3),
+                                     "AllClear clear-sky fraction"),
+                        "AC_ZP": (round(zp, 4),
+                                  "[mag] AllClear photometric zeropoint"),
+                    },
+                )
+                status_str += f"\n    -> {fits_path_out}"
+
+            if not args.no_plot and "png" in formats:
                 # Annotated image with matches
                 solved_path = str(out_base) + "_solved.png"
                 _save_annotated_image(
@@ -553,6 +662,7 @@ def cmd_solve(args):
                     transmission_data=(az, alt, trans),
                     obs_time=meta["obs_time"],
                     lat=inst.site_lat, lon=inst.site_lon,
+                    obscuration=inst.obscuration,
                 )
 
                 # Blink GIF: slow alternation between solved and transmission
@@ -600,7 +710,8 @@ def cmd_check(args):
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    result = fast_solve(data, det, cat, camera, guided=True)
+    result = fast_solve(data, det, cat, camera, guided=True,
+                        obscuration=inst.obscuration)
 
     if result.n_matched < 3:
         print(f"Insufficient matches ({result.n_matched}) — "
@@ -612,6 +723,7 @@ def cmd_check(args):
     az, alt, trans, zp = compute_transmission(
         use_det, cat, result.matched_pairs, result.camera_model,
         image=data, reference_zeropoint=ref_zp,
+        obscuration=inst.obscuration,
     )
     tmap = interpolate_transmission(az, alt, trans)
     clear_frac = float(np.nanmean(
@@ -746,7 +858,8 @@ def _save_blink_gif(path_a, path_b, output_path, duration_ms=1500,
 
 def _save_annotated_image(data, model, det, cat, output_path,
                           matched_pairs=None, transmission_data=None,
-                          obs_time=None, lat=None, lon=None):
+                          obs_time=None, lat=None, lon=None,
+                          obscuration=None):
     """Save an annotated frame image."""
     from .plotting import plot_frame
     from .matching import match_sources
@@ -773,6 +886,7 @@ def _save_annotated_image(data, model, det, cat, output_path,
         lat_deg=lat,
         lon_deg=lon,
         output_path=output_path,
+        obscuration=obscuration,
     )
 
 
@@ -803,6 +917,171 @@ def _save_diagnostic_plot(data, model, det, cat, n_matched, rms, diag, path,
                lat_deg=lat_deg, lon_deg=lon_deg, output_path=path,
                horizon_r=horizon_r, horizon_center=(horizon_cx, horizon_cy)
                if horizon_cx is not None else None)
+
+
+# ---- calibrate obscuration ----
+
+def cmd_calibrate_obscuration(args):
+    """Build a sky-space ObscurationMask from many solved frames.
+
+    For each frame:
+      1. Solve against the supplied instrument model.
+      2. Record each bright catalog star's (az, alt, detected) outcome.
+      3. Compute the frame's clear fraction from its transmission map.
+    After all frames are processed, aggregate outcomes in (az, alt)
+    bins via ``obscuration.build_from_observations`` and write the
+    resulting mask to the model's sidecar.
+    """
+    from .instrument import InstrumentModel
+    from .solver import fast_solve
+    from .catalog import BrightStarCatalog
+    from .detection import detect_stars
+    from .transmission import compute_transmission, interpolate_transmission
+    from .utils import load_image, parse_fits_header
+    from .obscuration import build_from_observations
+
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    model_file = pathlib.Path(args.model)
+    if not model_file.exists():
+        print(f"Model file not found: {args.model}", file=sys.stderr)
+        return 1
+    inst = InstrumentModel.load(model_file)
+    camera = inst.to_camera_model()
+
+    frames = _resolve_frames(args.frames)
+    if not frames:
+        print(f"No matching frames: {args.frames}", file=sys.stderr)
+        return 1
+
+    output = pathlib.Path(args.output) if args.output else \
+        InstrumentModel.obscuration_sidecar_path(model_file)
+
+    print(f"Calibrating obscuration from {len(frames)} frames against "
+          f"{model_file.name}")
+
+    cat_lib = BrightStarCatalog()
+
+    az_all = []
+    alt_all = []
+    det_all = []
+    vmag_all = []
+    cf_all = []
+
+    n_ok = 0
+    n_low = 0
+    for i, fpath in enumerate(frames):
+        try:
+            data, header = load_image(str(fpath))
+            meta = (parse_fits_header(header)
+                    if header is not None else {"obs_time": args._obs_time})
+            if meta.get("obs_time") is None:
+                n_low += 1
+                continue
+            cat = cat_lib.get_visible_stars(
+                inst.site_lat, inst.site_lon, meta["obs_time"])
+            det = detect_stars(data, fwhm=inst.detection_fwhm,
+                               threshold_sigma=inst.detection_threshold_sigma,
+                               n_brightest=1000)
+            if inst.mirrored:
+                data = data[:, ::-1]
+                det["x"] = (data.shape[1] - 1) - np.asarray(
+                    det["x"], dtype=np.float64)
+
+            result = fast_solve(data, det, cat, camera, guided=True)
+            if result.n_matched < 30:
+                n_low += 1
+                continue
+
+            # Frame clear fraction
+            use_det = (result.guided_det_table
+                       if result.guided_det_table is not None
+                       and len(result.guided_det_table) > 0 else det)
+            ref_zp = inst.photometric_zeropoint or None
+            az_t, alt_t, trans_t, _ = compute_transmission(
+                use_det, cat, result.matched_pairs, result.camera_model,
+                image=data, reference_zeropoint=ref_zp,
+            )
+            tmap = interpolate_transmission(az_t, alt_t, trans_t)
+            clear_frac = float(np.nanmean(
+                tmap.get_observability_mask(threshold=0.7)))
+
+            # Record in-frame bright catalog stars
+            cam_solved = result.camera_model
+            vmag = np.asarray(cat["vmag"], dtype=np.float64)
+            alt_deg = np.asarray(cat["alt_deg"], dtype=np.float64)
+            az_deg = np.asarray(cat["az_deg"], dtype=np.float64)
+
+            bright = vmag < args.vmag_max
+            idx = np.where(bright & (alt_deg > 5.0))[0]
+            if idx.size == 0:
+                continue
+            px, py = cam_solved.sky_to_pixel(
+                np.radians(az_deg[idx]), np.radians(alt_deg[idx]))
+            ny, nx = data.shape
+            in_frame = (np.isfinite(px) & np.isfinite(py)
+                        & (px >= 0) & (px < nx)
+                        & (py >= 0) & (py < ny))
+            matched_cat = {ci for _, ci in result.matched_pairs}
+
+            ok = idx[in_frame]
+            for ci in ok:
+                az_all.append(float(az_deg[ci]))
+                alt_all.append(float(alt_deg[ci]))
+                vmag_all.append(float(vmag[ci]))
+                det_all.append(1 if int(ci) in matched_cat else 0)
+                cf_all.append(clear_frac)
+            n_ok += 1
+
+            if args.verbose or (i + 1) % 10 == 0 or (i + 1) == len(frames):
+                print(f"  [{i+1}/{len(frames)}] {fpath.name}: "
+                      f"n_match={result.n_matched}, clear={clear_frac:.2f}",
+                      flush=True)
+        except Exception as exc:
+            if args.verbose:
+                print(f"  [{i+1}/{len(frames)}] {fpath.name}: "
+                      f"SKIP {type(exc).__name__}: {exc}", file=sys.stderr)
+            n_low += 1
+            continue
+
+    if not az_all:
+        print("No usable observations — all frames failed to solve.",
+              file=sys.stderr)
+        return 1
+
+    print(f"\n{n_ok}/{len(frames)} frames solved, "
+          f"{len(az_all):,} per-star observations collected "
+          f"({n_low} frames skipped)")
+
+    mask = build_from_observations(
+        az_deg=np.array(az_all), alt_deg=np.array(alt_all),
+        detected=np.array(det_all, dtype=np.int32),
+        clear_fraction=np.array(cf_all),
+        vmag=np.array(vmag_all),
+        clear_gate=args.clear_gate,
+        vmag_min=args.vmag_min, vmag_max=args.vmag_max,
+        min_visits=args.min_visits,
+        az_step_deg=args.az_step, alt_step_deg=args.alt_step,
+        n_frames=n_ok,
+    )
+
+    n_filled = int(np.isfinite(mask.weight).sum())
+    n_total = mask.weight.size
+    n_obscured = int(((mask.weight < 0.3) & np.isfinite(mask.weight)).sum())
+    print(f"Mask grid: {len(mask.alt_edges_deg) - 1} alt × "
+          f"{len(mask.az_edges_deg) - 1} az bins")
+    print(f"  Filled (≥ {args.min_visits} clear-sky visits): {n_filled:,} "
+          f"({100.0 * n_filled / n_total:.1f}%)")
+    print(f"  Obscured (weight < 0.3): {n_obscured:,}")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    mask.save(output)
+    print(f"\nSaved: {output}")
+    if output == InstrumentModel.obscuration_sidecar_path(model_file):
+        print(f"  (auto-loaded by `allclear solve --model {model_file.name}`)")
+
+    return 0
 
 
 if __name__ == "__main__":

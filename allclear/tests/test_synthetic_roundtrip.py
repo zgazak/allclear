@@ -31,9 +31,9 @@ class TestSyntheticRoundtrip:
         ])
         cat = Table({
             "az_deg": az_deg, "alt_deg": alt_deg,
-            "vmag": vmag, "vmag_extinct": vmag + 0.1,
+            "vmag": vmag, "vmag_expected": vmag + 0.1,
         })
-        cat.sort("vmag_extinct")
+        cat.sort("vmag_expected")
 
         image, truth = generate_synthetic_frame(
             camera_model=true_model, star_table=cat,
@@ -70,9 +70,9 @@ class TestSyntheticRoundtrip:
         ])
         cat = Table({
             "az_deg": az_deg, "alt_deg": alt_deg,
-            "vmag": vmag, "vmag_extinct": vmag + 0.1,
+            "vmag": vmag, "vmag_expected": vmag + 0.1,
         })
-        cat.sort("vmag_extinct")
+        cat.sort("vmag_expected")
 
         cloud_patches = [
             {"az_deg": 90, "alt_deg": 60, "radius_deg": 30, "opacity": 0.95},

@@ -1,11 +1,20 @@
-"""Instrument model: camera parameters saved/loaded as JSON."""
+"""Instrument model: camera parameters saved/loaded as JSON.
+
+An optional ``ObscurationMask`` sidecar lives next to the model JSON
+at ``<stem>_obscuration.json`` and is auto-loaded when present.  The
+mask represents persistent obscurations (dome, trees, dead columns,
+outside-horizon pixels) and is used by the detection, matching, and
+transmission stages to avoid treating occluded sky as cloud.
+"""
 
 import json
 import pathlib
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from typing import Optional
 
 from .projection import CameraModel, ProjectionType
+from .obscuration import ObscurationMask
 
 
 @dataclass
@@ -55,6 +64,11 @@ class InstrumentModel:
     # --- Bookkeeping ---
     allclear_version: str = ""
 
+    # --- Calibration artifacts (Tier 2) ---
+    # Obscuration is held as an in-memory field and persisted in a sidecar
+    # file so the main model JSON stays small and human-friendly.
+    obscuration: Optional[ObscurationMask] = field(default=None, repr=False)
+
     def __post_init__(self):
         if not self.allclear_version:
             from allclear import __version__
@@ -99,8 +113,18 @@ class InstrumentModel:
 
     # ---- Persistence ----
 
+    @staticmethod
+    def obscuration_sidecar_path(model_path):
+        """Path to the obscuration sidecar JSON next to a model JSON."""
+        p = pathlib.Path(model_path)
+        return p.with_name(p.stem + "_obscuration.json")
+
     def save(self, path):
-        """Save instrument model to a JSON file."""
+        """Save instrument model to a JSON file.
+
+        If ``self.obscuration`` is set, it is written to a sidecar
+        ``<stem>_obscuration.json`` alongside the model.
+        """
         path = pathlib.Path(path)
         data = {
             "allclear_version": self.allclear_version,
@@ -141,10 +165,16 @@ class InstrumentModel:
             },
         }
         path.write_text(json.dumps(data, indent=2) + "\n")
+        if self.obscuration is not None:
+            self.obscuration.save(self.obscuration_sidecar_path(path))
 
     @classmethod
     def load(cls, path) -> "InstrumentModel":
-        """Load instrument model from a JSON file."""
+        """Load instrument model from a JSON file.
+
+        If an obscuration sidecar exists at ``<stem>_obscuration.json``,
+        it is auto-loaded into the ``obscuration`` field.
+        """
         path = pathlib.Path(path)
         data = json.loads(path.read_text())
         site = data.get("site", {})
@@ -152,7 +182,7 @@ class InstrumentModel:
         det = data.get("detection", {})
         phot = data.get("photometry", {})
         fq = data.get("fit_quality", {})
-        return cls(
+        inst = cls(
             allclear_version=data.get("allclear_version", "0.2.0"),
             site_lat=site.get("latitude", 0.0),
             site_lon=site.get("longitude", 0.0),
@@ -180,3 +210,7 @@ class InstrumentModel:
             fit_timestamp=fq.get("fit_timestamp", ""),
             frame_used=fq.get("frame_used", ""),
         )
+        sidecar = cls.obscuration_sidecar_path(path)
+        if sidecar.exists():
+            inst.obscuration = ObscurationMask.load(sidecar)
+        return inst

@@ -3,7 +3,7 @@ name = "allclear"
 authors = [
   { name="Zach", email="jzg@alum.mit.edu" },
 ]
-version = "0.2.2"
+version = "1.0.0"
 description = "All-sky camera cloud detection via stellar transmission mapping"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,7 @@ dependencies = [
     "astropy",
     "photutils",
     "matplotlib",
+    "pyvo>=1.8.1",
 ]
 
 [project.optional-dependencies]

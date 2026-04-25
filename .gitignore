@@ -218,3 +218,23 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# AllClear: scratch + heavy intermediate data
+temp/
+*.pkl
+benchmark/data/fun_allsky/
+benchmark/results/apicam_nightly/images/
+benchmark/results/apicam_comparison/images/
+benchmark/results/apicam_seasonal/outliers/
+benchmark/results/apicam_seasonal/paranal_weather_2019.csv
+benchmark/results/obscuration/per_star_observations.csv
+
+# AllClear: paper sources (kept on Overleaf, not in this repo)
+*.tex
+*.bib
+PAPER.md
+ALLSKY_CLOUD_DETECTION_PROMPT.md
+
+# AllClear: benchmark outputs and solved models — kept locally, not in repo
+benchmark/results/
+benchmark/solutions/

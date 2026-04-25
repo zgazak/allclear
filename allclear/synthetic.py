@@ -25,7 +25,7 @@ def generate_synthetic_frame(
     camera_model : CameraModel, optional
         Camera geometry. Defaults to a zenith-pointing equidistant lens.
     star_table : astropy.table.Table, optional
-        Must have columns: az_deg, alt_deg, vmag (or vmag_extinct).
+        Must have columns: az_deg, alt_deg, vmag (or vmag_expected).
         If None, generates random stars.
     nx, ny : int
         Image dimensions.
@@ -65,7 +65,7 @@ def generate_synthetic_frame(
 
     az_rad = np.radians(np.asarray(star_table["az_deg"], dtype=np.float64))
     alt_rad = np.radians(np.asarray(star_table["alt_deg"], dtype=np.float64))
-    mag_col = "vmag_extinct" if "vmag_extinct" in star_table.colnames else "vmag"
+    mag_col = "vmag_expected" if "vmag_expected" in star_table.colnames else "vmag"
     vmag = np.asarray(star_table[mag_col], dtype=np.float64)
 
     # Project stars

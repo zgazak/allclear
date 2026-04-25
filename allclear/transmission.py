@@ -74,7 +74,8 @@ class TransmissionMap:
 def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
                          image=None, image_shape=None,
                          reference_zeropoint=None,
-                         probe_vmag_limit=7.0, probe_radius=8):
+                         probe_vmag_limit=7.0, probe_radius=8,
+                         obscuration=None):
     """Compute per-star transmission from matched photometry.
 
     When ``image`` is provided, flux is re-measured using local background
@@ -83,14 +84,17 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
     stars against structure glow rather than real starlight.
 
     Unmatched in-frame catalog stars are also probed: if no point source
-    is detected, they are marked as zero transmission.
+    is detected, they are marked as zero transmission.  Unmatched stars
+    whose sky position falls into a persistently-obscured direction
+    (per the ``obscuration`` mask) are excluded from probing —
+    occlusion is a separate state from cloud opacity.
 
     Parameters
     ----------
     det_table : Table
         Detected sources with columns: x, y, flux.
     cat_table : Table
-        Catalog stars with columns: vmag_extinct.
+        Catalog stars with columns: vmag_expected.
     matched_pairs : list of (det_idx, cat_idx)
         Matched detection–catalog pairs.
     camera_model : CameraModel
@@ -109,6 +113,11 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
         Magnitude limit for probing unmatched stars (default 5.5).
     probe_radius : int
         Half-size of the box for peak/background measurement.
+    obscuration : ObscurationMask, optional
+        Sky-coordinate mask of persistent obstructions.  When provided,
+        unmatched stars that project into obscured directions are
+        excluded from the zero-transmission probe so permanent
+        obstructions are not classified as cloud.
 
     Returns
     -------
@@ -124,7 +133,7 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
     if len(matched_pairs) == 0:
         return np.array([]), np.array([]), np.array([]), 0.0
 
-    cat_vmag = np.array([float(cat_table["vmag_extinct"][ci]) for di, ci in matched_pairs])
+    cat_vmag = np.array([float(cat_table["vmag_expected"][ci]) for di, ci in matched_pairs])
     cat_az = np.array([float(cat_table["az_deg"][ci]) for di, ci in matched_pairs])
     cat_alt = np.array([float(cat_table["alt_deg"][ci]) for di, ci in matched_pairs])
 
@@ -143,11 +152,12 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
 
         det_flux = np.zeros(len(matched_pairs), dtype=np.float64)
         for k, (di, ci) in enumerate(matched_pairs):
-            # Forced photometry at MODEL-PREDICTED position.
-            # Use a small aperture (3×3) for the peak to avoid grabbing
-            # a neighboring star, with a wider annulus for background.
-            x = float(px_all[ci])
-            y = float(py_all[ci])
+            # Photometry at the DETECTED centroid position.  The guided
+            # matcher already centroids each star to sub-pixel accuracy;
+            # using that instead of the model prediction avoids flux loss
+            # when the model has positional error (pointing drift).
+            x = float(det_table["x"][di])
+            y = float(det_table["y"][di])
             xi, yi = int(round(x)), int(round(y))
             if xi < r or xi >= nx - r or yi < r or yi >= ny - r:
                 det_flux[k] = max(0, float(det_table["flux"][di]))
@@ -180,13 +190,23 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
     else:
         frame_zeropoint = 0.0
 
-    # Use reference zeropoint if available (absolute scale);
-    # otherwise fall back to per-frame (relative scale)
+    # Use the BEST (largest) of reference and per-frame zeropoints.
+    # Larger zeropoint = brighter stars = clearer sky.  If this frame
+    # measures a better zeropoint than the reference, the reference was
+    # calibrated under worse conditions — use the frame's value.
+    # Only upgrade when the per-frame measurement is reliable (enough
+    # matches and low scatter in the photometric offsets).
     if reference_zeropoint is not None and reference_zeropoint != 0.0:
         zeropoint = reference_zeropoint
         # Auto-correct old-convention negative zeropoints (pre-v0.3)
         if zeropoint < 0:
             zeropoint = -zeropoint
+        n_valid = int(np.sum(valid))
+        if n_valid >= 50:
+            offsets = cat_vmag[valid] - inst_mag[valid]
+            scatter = float(np.std(offsets))
+            if scatter < 1.0 and frame_zeropoint > zeropoint:
+                zeropoint = frame_zeropoint
     else:
         zeropoint = frame_zeropoint
 
@@ -195,7 +215,11 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
     transmission = np.full_like(det_flux, np.nan)
     transmission[valid] = 10 ** (-0.4 * (inst_mag[valid] + zeropoint - cat_vmag[valid]))
 
-    # Probe unmatched catalog stars for zero-transmission regions
+    # Probe unmatched catalog stars — measure actual transmission
+    # rather than binary detect/not-detect.  In moonlit clouds, cloud
+    # structure can exceed a simple contrast threshold, but its flux is
+    # far below expected stellar flux, so measuring transmission
+    # correctly identifies opaque regions.
     if image is not None or image_shape is not None:
         if image is not None:
             ny_img, nx_img = image.shape
@@ -204,7 +228,7 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
 
         all_az_deg = np.asarray(cat_table["az_deg"], dtype=np.float64)
         all_alt_deg = np.asarray(cat_table["alt_deg"], dtype=np.float64)
-        all_vmag = np.asarray(cat_table["vmag_extinct"], dtype=np.float64)
+        all_vmag = np.asarray(cat_table["vmag_expected"], dtype=np.float64)
 
         all_az_rad = np.radians(all_az_deg)
         all_alt_rad = np.radians(all_alt_deg)
@@ -224,14 +248,18 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
 
         candidates = np.where(in_frame & bright & unmatched_mask)[0]
 
-        if len(candidates) > 0:
-            zero_az = []
-            zero_alt = []
+        # Obscuration mask (sky coordinates): drop probes that sit in
+        # persistently-obscured directions so they don't read as cloud.
+        if obscuration is not None and len(candidates) > 0:
+            visible = obscuration.is_visible(
+                all_az_deg[candidates], all_alt_deg[candidates]
+            )
+            candidates = candidates[visible]
 
-            # Adaptive threshold for probing — use noise-based minimum
-            bg_est = float(np.median(image)) if image is not None else 0
-            noise_est = max(30.0, np.sqrt(abs(bg_est)))
-            probe_threshold = 5.0 * noise_est  # 5-sigma for probing
+        if len(candidates) > 0:
+            probe_az = []
+            probe_alt = []
+            probe_trans = []
 
             if image is not None:
                 rr = probe_radius
@@ -239,7 +267,6 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
                     xi = int(round(px[ci]))
                     yi = int(round(py[ci]))
                     box = image[yi - rr:yi + rr + 1, xi - rr:xi + rr + 1]
-                    # Use small aperture at predicted position
                     sr = min(2, rr)
                     inner = box[rr - sr:rr + sr + 1, rr - sr:rr + sr + 1]
                     peak = float(np.max(inner))
@@ -247,19 +274,29 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
                         box[0, :], box[-1, :], box[1:-1, 0], box[1:-1, -1]
                     ])
                     local_bg = float(np.median(edge))
-                    if (peak - local_bg) < probe_threshold:
-                        zero_az.append(all_az_deg[ci])
-                        zero_alt.append(all_alt_deg[ci])
-            else:
-                zero_az = list(all_az_deg[candidates])
-                zero_alt = list(all_alt_deg[candidates])
+                    flux = max(0.0, peak - local_bg)
 
-            n_zero = len(zero_az)
-            if n_zero > 0:
-                cat_az = np.concatenate([cat_az, np.array(zero_az)])
-                cat_alt = np.concatenate([cat_alt, np.array(zero_alt)])
+                    probe_az.append(all_az_deg[ci])
+                    probe_alt.append(all_alt_deg[ci])
+
+                    if flux > 0:
+                        probe_inst = -2.5 * np.log10(flux)
+                        t = 10 ** (-0.4 * (probe_inst + zeropoint
+                                           - all_vmag[ci]))
+                        probe_trans.append(float(np.clip(t, 0, 2.0)))
+                    else:
+                        probe_trans.append(0.0)
+            else:
+                probe_az = list(all_az_deg[candidates])
+                probe_alt = list(all_alt_deg[candidates])
+                probe_trans = [0.0] * len(candidates)
+
+            n_probe = len(probe_az)
+            if n_probe > 0:
+                cat_az = np.concatenate([cat_az, np.array(probe_az)])
+                cat_alt = np.concatenate([cat_alt, np.array(probe_alt)])
                 transmission = np.concatenate([
-                    transmission, np.zeros(n_zero)
+                    transmission, np.array(probe_trans)
                 ])
 
     return cat_az, cat_alt, transmission, zeropoint
