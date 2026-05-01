@@ -994,6 +994,13 @@ def _fit_model_to_pairs(det_x, det_y, cat_az, cat_alt, model,
     proj_type = model.proj_type
     fixed_az0 = model.az0
 
+    # The horizon-radius penalty exists to break the f/k1 degeneracy when
+    # both are being fit. When distortion is fixed at zero, the penalty
+    # adds aggressive pressure on f without anything to absorb its tension
+    # against bright-star residuals, biasing the fit. Disable it.
+    if not fit_distortion:
+        horizon_r = None
+
     # Compute physically meaningful distortion bounds based on focal length.
     # At r = f (zenith angle ~1 rad), we want |k1*r^2| < 0.3 and |k2*r^4| < 0.15
     # Fisheye lenses typically have barrel distortion (k1 ≤ 0) with equidistant
@@ -2442,6 +2449,199 @@ def pixel_brightness_grid_search(image, cat_az, cat_alt, cx, cy,
     )
 
 
+# ---------------------------------------------------------------------------
+# Distortion flex-test (post-fit): does the model need k1/k2?
+# ---------------------------------------------------------------------------
+
+def _bright_star_distance(model, cat_az, cat_alt, vmag, alt_deg,
+                           det_x, det_y, vmag_lim=2.0, alt_min=5.0,
+                           image_shape=None):
+    """Median distance from projected bright catalog stars to nearest detection.
+
+    Honest metric for fit quality — vmag<2 stars are unique enough that
+    "nearest detection" is unambiguous, so this can't be fooled by
+    self-consistent wrong-star matches the way iterative-RMS can.
+    """
+    sel = (vmag < vmag_lim) & (alt_deg > alt_min)
+    if not np.any(sel):
+        return float("nan"), 0
+    px, py = model.sky_to_pixel(cat_az[sel], cat_alt[sel])
+    finite = np.isfinite(px) & np.isfinite(py)
+    if image_shape is not None:
+        ny, nx = image_shape
+        finite &= (px > 5) & (px < nx - 5) & (py > 5) & (py < ny - 5)
+    px, py = px[finite], py[finite]
+    if len(px) < 3:
+        return float("nan"), int(np.sum(finite))
+    tree = KDTree(np.column_stack([det_x, det_y]))
+    d, _ = tree.query(np.column_stack([px, py]), k=1, distance_upper_bound=200)
+    d = d[np.isfinite(d)]
+    if len(d) == 0:
+        return float("nan"), 0
+    return float(np.median(d)), int(len(d))
+
+
+def _per_alt_signed_radial(model, cat_az, cat_alt, vmag, alt_deg,
+                            det_x, det_y, image_shape, vmag_lim=5.0,
+                            max_d=10.0,
+                            bands=((5, 10), (10, 15), (15, 20), (20, 30),
+                                   (30, 60), (60, 90))):
+    """Median signed-radial residual per altitude band.
+
+    Negative = real star inward of catalog circle (toward zenith).
+    Positive = real star outward of circle (toward horizon).
+    Stars are matched to nearest detection within ``max_d`` pixels.
+    """
+    sel = (vmag < vmag_lim) & (alt_deg > 0.5)
+    px, py = model.sky_to_pixel(cat_az, cat_alt)
+    ny, nx = image_shape
+    sel &= (np.isfinite(px) & np.isfinite(py)
+            & (px > 20) & (px < nx - 20) & (py > 20) & (py < ny - 20))
+    tree = KDTree(np.column_stack([det_x, det_y]))
+    rads_by_band = {b: [] for b in bands}
+    for i in np.where(sel)[0]:
+        d, j = tree.query([px[i], py[i]], k=1, distance_upper_bound=max_d)
+        if not np.isfinite(d):
+            continue
+        ux = px[i] - model.cx
+        uy = py[i] - model.cy
+        rmag = np.sqrt(ux * ux + uy * uy)
+        if rmag < 5:
+            continue
+        ux /= rmag
+        uy /= rmag
+        rad = (det_x[j] - px[i]) * ux + (det_y[j] - py[i]) * uy
+        ad = alt_deg[i]
+        for lo, hi in bands:
+            if lo <= ad < hi:
+                rads_by_band[(lo, hi)].append(rad)
+                break
+    return {b: (float(np.median(v)) if len(v) >= 3 else None)
+            for b, v in rads_by_band.items()}
+
+
+def _flex_test(image, det_table, cat_az, cat_alt, vmag, alt_deg,
+                model, hr, lock_tol=3.0, vmag_lim_lock=5.0,
+                bright_vmag=2.0, min_improvement=0.5,
+                max_degradation=1.0, verbose=False):
+    """Test whether adding k1+k2 distortion improves the no-distortion fit.
+
+    Locks pairs from the no-distortion projection (so the comparison is
+    not rigged), refits geometry+distortion on those locked pairs, then
+    accepts distortion only if:
+      - bright-star (vmag<bright_vmag) median distance improves by
+        ≥ min_improvement px, AND
+      - no altitude band's signed-radial residual gets worse by more
+        than max_degradation px.
+
+    Returns (model, accepted, diag_dict).
+    """
+    det_x = np.asarray(det_table["x"], dtype=np.float64)
+    det_y = np.asarray(det_table["y"], dtype=np.float64)
+    image_shape = image.shape
+
+    # Pre-flex baseline
+    bs_no, n_bs = _bright_star_distance(
+        model, cat_az, cat_alt, vmag, alt_deg, det_x, det_y,
+        vmag_lim=bright_vmag, image_shape=image_shape,
+    )
+    pa_no = _per_alt_signed_radial(
+        model, cat_az, cat_alt, vmag, alt_deg, det_x, det_y, image_shape,
+    )
+
+    diag = {
+        "bright_star_no_distortion": bs_no,
+        "n_bright": n_bs,
+        "per_alt_no_distortion": pa_no,
+        "k1_initial": model.k1,
+        "k2_initial": model.k2,
+    }
+
+    # Lock pairs using the no-distortion projection
+    px, py = model.sky_to_pixel(cat_az, cat_alt)
+    ny, nx = image_shape
+    in_img = (np.isfinite(px) & np.isfinite(py)
+              & (px > 20) & (px < nx - 20)
+              & (py > 20) & (py < ny - 20))
+    sel = in_img & (vmag < vmag_lim_lock) & (alt_deg > 0.5)
+    if not np.any(sel):
+        diag["accepted"] = False
+        diag["reason"] = "no candidate stars for locking"
+        return model, False, diag
+    tree = KDTree(np.column_stack([det_x, det_y]))
+    cand_idx = np.where(sel)[0]
+    d_arr, j_arr = tree.query(np.column_stack([px[cand_idx], py[cand_idx]]),
+                               k=1, distance_upper_bound=lock_tol)
+    keep = np.isfinite(d_arr)
+    locked_cat = cand_idx[keep]
+    locked_det = j_arr[keep]
+    diag["n_locked"] = int(np.sum(keep))
+
+    if diag["n_locked"] < 50:
+        diag["accepted"] = False
+        diag["reason"] = f"too few locked pairs ({diag['n_locked']})"
+        return model, False, diag
+
+    # Refit geometry + distortion on the locked pairs
+    locked_az = cat_az[locked_cat]
+    locked_alt = cat_alt[locked_cat]
+    locked_dx = det_x[locked_det]
+    locked_dy = det_y[locked_det]
+    try:
+        model_dist = _fit_model_to_pairs(
+            locked_dx, locked_dy, locked_az, locked_alt, model,
+            fit_distortion=True, fix_az0=False,
+            horizon_r=hr, horizon_weight=1.0,
+        )
+    except Exception as exc:
+        diag["accepted"] = False
+        diag["reason"] = f"distortion refit failed: {exc}"
+        return model, False, diag
+
+    diag["k1_flexed"] = model_dist.k1
+    diag["k2_flexed"] = model_dist.k2
+
+    # Score the flexed model
+    bs_dist, _ = _bright_star_distance(
+        model_dist, cat_az, cat_alt, vmag, alt_deg, det_x, det_y,
+        vmag_lim=bright_vmag, image_shape=image_shape,
+    )
+    pa_dist = _per_alt_signed_radial(
+        model_dist, cat_az, cat_alt, vmag, alt_deg, det_x, det_y, image_shape,
+    )
+    diag["bright_star_with_distortion"] = bs_dist
+    diag["per_alt_with_distortion"] = pa_dist
+
+    # Decision gates
+    bs_improvement = (bs_no - bs_dist) if (np.isfinite(bs_no)
+                                            and np.isfinite(bs_dist)) else 0.0
+    diag["bright_star_improvement"] = bs_improvement
+
+    max_degraded = 0.0
+    for band, val_no in pa_no.items():
+        val_dist = pa_dist.get(band)
+        if val_no is None or val_dist is None:
+            continue
+        # Degradation = |residual| got bigger after distortion
+        deg = abs(val_dist) - abs(val_no)
+        if deg > max_degraded:
+            max_degraded = deg
+    diag["max_band_degradation"] = max_degraded
+
+    accepted = (bs_improvement >= min_improvement
+                and max_degraded <= max_degradation)
+    diag["accepted"] = accepted
+    if accepted:
+        diag["reason"] = (f"distortion accepted (Δbs={bs_improvement:.2f}, "
+                          f"max band degradation={max_degraded:.2f})")
+        return model_dist, True, diag
+    else:
+        diag["reason"] = (f"distortion rejected (Δbs={bs_improvement:.2f} "
+                          f"< {min_improvement}, max degradation="
+                          f"{max_degraded:.2f})")
+        return model, False, diag
+
+
 def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                             verbose=False, meta=None, progress=None):
     """Full instrument characterization pipeline.
@@ -3061,12 +3261,29 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                              f"({best_alt_n} matches, "
                              f"RMS={best_alt_rms:.1f})")
 
-    # --- Step 6: Joint geometry + distortion refinement ---
-    # Use guided matching (finds many matches) with f_scale=50 in the
-    # optimizer so the horizon constraint actually works (was being
-    # downweighted by soft_l1 loss with f_scale=5).
+    # --- Step 6: Geometry refinement (no distortion) ---
+    # All Step 6 phases run with fit_distortion=False. Distortion is
+    # opt-in via the Step 7 flex test, which only accepts it if it
+    # materially improves the bright-star metric. To prevent any
+    # spurious k1 from Step 5a contaminating the geometry refinement,
+    # zero out distortion on the seed before Step 6 starts.
+    dist_seed = CameraModel(
+        cx=dist_seed.cx, cy=dist_seed.cy,
+        az0=dist_seed.az0, alt0=dist_seed.alt0,
+        rho=dist_seed.rho, f=dist_seed.f,
+        proj_type=dist_seed.proj_type,
+        k1=0.0, k2=0.0,
+    )
+    if alt_proj_seed is not None:
+        alt_proj_seed = CameraModel(
+            cx=alt_proj_seed.cx, cy=alt_proj_seed.cy,
+            az0=alt_proj_seed.az0, alt0=alt_proj_seed.alt0,
+            rho=alt_proj_seed.rho, f=alt_proj_seed.f,
+            proj_type=alt_proj_seed.proj_type,
+            k1=0.0, k2=0.0,
+        )
     if verbose:
-        log.info("Step 6: Joint geometry + distortion refinement")
+        log.info("Step 6: Geometry refinement (no distortion)")
     if progress:
         progress("refine_start")
 
@@ -3077,7 +3294,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         min_peak_offset=min_peak_offset,
         alt_min_deg=15, alt_max_deg=75,
         fix_az0=near_zenith,
-        fit_distortion=True,
+        fit_distortion=False,
         horizon_r=hr, horizon_weight=2.0,
     )
     if verbose:
@@ -3097,7 +3314,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         min_peak_offset=min_peak_offset,
         alt_min_deg=5, alt_max_deg=88,
         fix_az0=near_zenith,
-        fit_distortion=True,
+        fit_distortion=False,
         horizon_r=hr, horizon_weight=2.0,
     )
     if verbose:
@@ -3117,7 +3334,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         min_peak_offset=min_peak_offset,
         alt_min_deg=3, alt_max_deg=88,
         fix_az0=near_zenith,
-        fit_distortion=True,
+        fit_distortion=False,
         horizon_r=hr, horizon_weight=1.0,
     )
     if verbose:
@@ -3146,7 +3363,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         n_iterations=20,
         alt_min_deg=3, alt_max_deg=88,
         fix_az0=near_zenith,
-        fit_distortion=True,
+        fit_distortion=False,
         horizon_r=hr, horizon_weight=1.0,
     )
     if verbose:
@@ -3179,7 +3396,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         min_peak_offset=min_peak_offset,
         alt_min_deg=5, alt_max_deg=88,
         fix_az0=False,
-        fit_distortion=True,
+        fit_distortion=False,
         horizon_r=hr, horizon_weight=1.0,
         initial_search_radius=phase_e_sr,
     )
@@ -3226,7 +3443,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             min_peak_offset=min_peak_offset,
             alt_min_deg=10, alt_max_deg=80,
             fix_az0=near_zenith,
-            fit_distortion=True,
+            fit_distortion=False,
             horizon_r=hr, horizon_weight=2.0,
         )
         # F.3: Widen altitude range
@@ -3236,7 +3453,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             min_peak_offset=min_peak_offset,
             alt_min_deg=5, alt_max_deg=88,
             fix_az0=near_zenith,
-            fit_distortion=True,
+            fit_distortion=False,
             horizon_r=hr, horizon_weight=1.0,
         )
         # F.4: Detection-based refinement
@@ -3245,7 +3462,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             n_iterations=20,
             alt_min_deg=3, alt_max_deg=88,
             fix_az0=near_zenith,
-            fit_distortion=True,
+            fit_distortion=False,
             horizon_r=hr, horizon_weight=1.0,
         )
         # Pick best from alt-projection phases
@@ -3382,7 +3599,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             image, wide_az, wide_alt, sweep_seed,
             n_iterations=15, min_peak_offset=min_peak_offset,
             alt_min_deg=15, alt_max_deg=75,
-            fix_az0=True, fit_distortion=True,
+            fix_az0=True, fit_distortion=False,
             horizon_r=hr, horizon_weight=1.0,
         )
         if progress:
@@ -3396,7 +3613,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             image, wide_az, wide_alt, sweep_seed,
             n_iterations=15, min_peak_offset=min_peak_offset,
             alt_min_deg=5, alt_max_deg=88,
-            fix_az0=True, fit_distortion=True,
+            fix_az0=True, fit_distortion=False,
             horizon_r=hr, horizon_weight=1.0,
         )
         if progress:
@@ -3411,7 +3628,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             image, cat_az[deep_mask], cat_alt[deep_mask], sweep_seed,
             n_iterations=15, min_peak_offset=min_peak_offset,
             alt_min_deg=5, alt_max_deg=88,
-            fix_az0=False, fit_distortion=True,
+            fix_az0=False, fit_distortion=False,
             horizon_r=hr, horizon_weight=1.0,
         )
         n_sweep_final = n_sw4 if n_sw4 > max(n_sw2, n_sw3) else max(n_sw2, n_sw3)
@@ -3515,6 +3732,32 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                 log.info(f"  Mean offset: ({rd['mean_dx']:.2f}, "
                          f"{rd['mean_dy']:.2f})")
 
+    # --- Step 7: Distortion flex test ---
+    # The pipeline above runs with fit_distortion=False (k1=k2=0). Now test
+    # whether adding distortion materially improves the fit on the bright-star
+    # metric AND doesn't degrade any altitude band. Accept distortion only if
+    # both gates pass; otherwise the pure-geometry model wins.
+    if verbose:
+        log.info("Step 7: Distortion flex test")
+    if progress:
+        progress("flex_test_start")
+    flex_model, flex_accepted, flex_diag = _flex_test(
+        image, det_table, cat_az, cat_alt, vmag_ext, cat_alt_deg,
+        best_model, hr, verbose=verbose,
+    )
+    diag["flex_test"] = flex_diag
+    if verbose:
+        log.info(f"  Bright-star (vmag<2) median: "
+                 f"no-distortion={flex_diag.get('bright_star_no_distortion'):.2f} "
+                 f"vs +distortion="
+                 f"{flex_diag.get('bright_star_with_distortion', float('nan'))}")
+        log.info(f"  → {flex_diag['reason']}")
+    if progress:
+        progress("flex_test_done", accepted=flex_accepted,
+                 reason=flex_diag.get("reason", ""))
+    if flex_accepted:
+        best_model = flex_model
+
     diag["final_n_matched"] = best_n
     diag["final_rms"] = best_rms
     diag["final_f"] = best_model.f
@@ -3522,6 +3765,7 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     diag["final_projection"] = best_model.proj_type.value
     diag["final_k1"] = best_model.k1
     diag["final_k2"] = best_model.k2
+    diag["final_distortion_used"] = bool(flex_accepted)
 
     if verbose:
         log.info(f"Final: {best_n} matches, RMS={best_rms:.2f}, "
