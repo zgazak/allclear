@@ -40,6 +40,31 @@ def _r_to_theta(r, f, proj_type):
     raise ValueError(f"Unknown projection type: {proj_type}")
 
 
+def _saemundsson_refraction(alt_rad, P_mbar=1010.0, T_C=10.0):
+    """True altitude → upward shift from atmospheric refraction (radians).
+
+    apparent_alt = true_alt + R(true_alt). Saemundsson (1986).
+    Clamped to alt >= -1 deg and R >= 0 to stay smooth across the horizon
+    and at zenith (formula goes slightly negative there for empirical reasons).
+    """
+    alt_deg = np.degrees(np.asarray(alt_rad, dtype=np.float64))
+    alt_clip = np.maximum(alt_deg, -1.0)
+    R_arcmin = 1.02 / np.tan(np.radians(alt_clip + 10.3 / (alt_clip + 5.11)))
+    R_arcmin *= (P_mbar / 1010.0) * (283.0 / (273.0 + T_C))
+    R_arcmin = np.maximum(R_arcmin, 0.0)
+    return np.radians(R_arcmin / 60.0)
+
+
+def _bennett_refraction(alt_app_rad, P_mbar=1010.0, T_C=10.0):
+    """Apparent altitude → refraction (radians). true_alt = apparent_alt - R."""
+    alt_deg = np.degrees(np.asarray(alt_app_rad, dtype=np.float64))
+    alt_clip = np.maximum(alt_deg, -0.5)
+    R_arcmin = 1.0 / np.tan(np.radians(alt_clip + 7.31 / (alt_clip + 4.4)))
+    R_arcmin *= (P_mbar / 1010.0) * (283.0 / (273.0 + T_C))
+    R_arcmin = np.maximum(R_arcmin, 0.0)
+    return np.radians(R_arcmin / 60.0)
+
+
 def _apply_distortion(r, k1, k2):
     """Apply radial distortion: r' = r * (1 + k1*r^2 + k2*r^4)."""
     r2 = r * r
@@ -125,6 +150,10 @@ class CameraModel:
         az = np.asarray(az, dtype=np.float64)
         alt = np.asarray(alt, dtype=np.float64)
 
+        # Atmospheric refraction: a true ray from (az, alt) hits the sensor
+        # as if it came from (az, alt + R). Bend altitude before projecting.
+        alt = alt + _saemundsson_refraction(alt)
+
         # Direction vectors in ground frame (x=E, y=N, z=Up)
         cos_alt = np.cos(alt)
         dx = cos_alt * np.sin(az)
@@ -187,6 +216,10 @@ class CameraModel:
 
         az = np.arctan2(dx, dy) % (2 * np.pi)
         alt = np.arcsin(np.clip(dz, -1, 1))
+
+        # Pixel altitude is apparent (refracted); subtract refraction to get
+        # the true (geometric) sky altitude.
+        alt = alt - _bennett_refraction(alt)
 
         return az, alt
 
