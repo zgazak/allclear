@@ -70,6 +70,9 @@ def main(argv=None):
                          help="Allow wide rotation search if initial solve "
                               "fails. Use for cameras on rotating mounts or "
                               "platforms that have been physically moved.")
+    p_solve.add_argument("--no-refine", action="store_true",
+                         help="Use the input model as-is; skip the pointing/"
+                              "geometry refinement that solve normally runs.")
     p_solve.add_argument("--verbose", "-v", action="store_true",
                          help="Show detailed solver logging")
 
@@ -563,6 +566,7 @@ def cmd_solve(args):
 
         result = fast_solve(data, det, cat, camera, guided=True,
                             refit_rotation=args.refit_rotation,
+                            refine=not args.no_refine,
                             obscuration=inst.obscuration)
 
         status_str = f"  [{i+1}/{len(frames)}] {fpath.name}: "
