@@ -150,10 +150,6 @@ class CameraModel:
         az = np.asarray(az, dtype=np.float64)
         alt = np.asarray(alt, dtype=np.float64)
 
-        # Atmospheric refraction: a true ray from (az, alt) hits the sensor
-        # as if it came from (az, alt + R). Bend altitude before projecting.
-        alt = alt + _saemundsson_refraction(alt)
-
         # Direction vectors in ground frame (x=E, y=N, z=Up)
         cos_alt = np.cos(alt)
         dx = cos_alt * np.sin(az)
@@ -216,10 +212,6 @@ class CameraModel:
 
         az = np.arctan2(dx, dy) % (2 * np.pi)
         alt = np.arcsin(np.clip(dz, -1, 1))
-
-        # Pixel altitude is apparent (refracted); subtract refraction to get
-        # the true (geometric) sky altitude.
-        alt = alt - _bennett_refraction(alt)
 
         return az, alt
 

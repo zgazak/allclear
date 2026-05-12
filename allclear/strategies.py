@@ -3261,226 +3261,269 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                              f"({best_alt_n} matches, "
                              f"RMS={best_alt_rms:.1f})")
 
-    # --- Step 6: Geometry refinement (no distortion) ---
-    # All Step 6 phases run with fit_distortion=False. Distortion is
-    # opt-in via the Step 7 flex test, which only accepts it if it
-    # materially improves the bright-star metric. To prevent any
-    # spurious k1 from Step 5a contaminating the geometry refinement,
-    # zero out distortion on the seed before Step 6 starts.
-    dist_seed = CameraModel(
-        cx=dist_seed.cx, cy=dist_seed.cy,
-        az0=dist_seed.az0, alt0=dist_seed.alt0,
-        rho=dist_seed.rho, f=dist_seed.f,
-        proj_type=dist_seed.proj_type,
-        k1=0.0, k2=0.0,
-    )
-    if alt_proj_seed is not None:
-        alt_proj_seed = CameraModel(
-            cx=alt_proj_seed.cx, cy=alt_proj_seed.cy,
-            az0=alt_proj_seed.az0, alt0=alt_proj_seed.alt0,
-            rho=alt_proj_seed.rho, f=alt_proj_seed.f,
-            proj_type=alt_proj_seed.proj_type,
-            k1=0.0, k2=0.0,
-        )
-    if verbose:
-        log.info("Step 6: Geometry refinement (no distortion)")
-    if progress:
-        progress("refine_start")
+    # --- Step 6: Geometry refinement (run twice: k1=0 and k1 free) ---
+    # The Step 7 flex test alone can't recover from a Step 6 that has
+    # converged in the k1=0 basin: the radial signal that k1 should
+    # carry gets absorbed into f/cx/cy, and adding k1 only at lock-time
+    # makes things worse, not better. So we run the full Step 6 twice
+    # and pick the winner. Cost: ~2x the refinement time per frame.
+    step5_dist_seed = dist_seed  # preserve k1 from Step 5a
+    step5_alt_seed = alt_proj_seed
+    step6_init_best_model = best_model
+    step6_init_best_n = best_n
+    step6_init_best_rms = best_rms
 
-    # Phase A: Joint fit from analytical seed, mid-altitude
-    m6a, n6a, rms6a = guided_refine(
-        image, wide_az, wide_alt, dist_seed,
-        n_iterations=15,
-        min_peak_offset=min_peak_offset,
-        alt_min_deg=15, alt_max_deg=75,
-        fix_az0=near_zenith,
-        fit_distortion=False,
-        horizon_r=hr, horizon_weight=2.0,
-    )
-    if verbose:
-        r_h = _apply_distortion(
-            _theta_to_r(np.pi / 2, m6a.f, m6a.proj_type), m6a.k1, m6a.k2)
-        log.info(f"  Phase A (mid-alt): {n6a} matches, RMS={rms6a:.1f}, "
-                 f"f={m6a.f:.0f}, k1={m6a.k1:.2e}, "
-                 f"horizon={r_h:.0f}px")
-    if progress:
-        progress("refine_phase", phase="A", n_matches=n6a,
-                 rms=rms6a, f=m6a.f)
+    def _run_step_6_phases(seed, alt_seed, fit_distortion, tag):
+        """Run Step 6 phases A-E (+ F if alt seed) with given distortion mode.
 
-    # Phase B: Broaden to include low-altitude stars
-    m6b, n6b, rms6b = guided_refine(
-        image, wide_az, wide_alt, m6a,
-        n_iterations=15,
-        min_peak_offset=min_peak_offset,
-        alt_min_deg=5, alt_max_deg=88,
-        fix_az0=near_zenith,
-        fit_distortion=False,
-        horizon_r=hr, horizon_weight=2.0,
-    )
-    if verbose:
-        r_h = _apply_distortion(
-            _theta_to_r(np.pi / 2, m6b.f, m6b.proj_type), m6b.k1, m6b.k2)
-        log.info(f"  Phase B (wide): {n6b} matches, RMS={rms6b:.1f}, "
-                 f"f={m6b.f:.0f}, k1={m6b.k1:.2e}, "
-                 f"horizon={r_h:.0f}px")
-    if progress:
-        progress("refine_phase", phase="B", n_matches=n6b,
-                 rms=rms6b, f=m6b.f)
-
-    # Phase C: Full-field final refinement
-    m6c, n6c, rms6c = guided_refine(
-        image, wide_az, wide_alt, m6b,
-        n_iterations=15,
-        min_peak_offset=min_peak_offset,
-        alt_min_deg=3, alt_max_deg=88,
-        fix_az0=near_zenith,
-        fit_distortion=False,
-        horizon_r=hr, horizon_weight=1.0,
-    )
-    if verbose:
-        r_h = _apply_distortion(
-            _theta_to_r(np.pi / 2, m6c.f, m6c.proj_type), m6c.k1, m6c.k2)
-        log.info(f"  Phase C (full-field): {n6c} matches, RMS={rms6c:.1f}, "
-                 f"f={m6c.f:.0f}, k1={m6c.k1:.2e}, "
-                 f"horizon={r_h:.0f}px")
-    if progress:
-        progress("refine_phase", phase="C", n_matches=n6c,
-                 rms=rms6c, f=m6c.f)
-
-    # Pick the best of Phases A/B/C
-    for m_cand, n_cand, rms_cand in [(m6a, n6a, rms6a), (m6b, n6b, rms6b),
-                                      (m6c, n6c, rms6c)]:
-        if _is_better(n_cand, rms_cand, best_n, best_rms):
-            best_model = m_cand
-            best_n = n_cand
-            best_rms = rms_cand
-
-    # Phase D: Detection-based matching with full catalog.
-    # Uses model-independent DAOStarFinder positions to avoid the
-    # self-reinforcing error problem with guided matching on huge catalogs.
-    m6d, n6d, rms6d = detection_refine(
-        det_table, full_az, full_alt, best_model,
-        n_iterations=20,
-        alt_min_deg=3, alt_max_deg=88,
-        fix_az0=near_zenith,
-        fit_distortion=False,
-        horizon_r=hr, horizon_weight=1.0,
-    )
-    if verbose:
-        r_h = _apply_distortion(
-            _theta_to_r(np.pi / 2, m6d.f, m6d.proj_type), m6d.k1, m6d.k2)
-        log.info(f"  Phase D (full catalog det): {n6d} matches, RMS={rms6d:.1f}, "
-                 f"f={m6d.f:.0f}, k1={m6d.k1:.2e}, "
-                 f"horizon={r_h:.0f}px")
-    if progress:
-        progress("refine_phase", phase="D", n_matches=n6d,
-                 rms=rms6d, f=m6d.f)
-
-    if _is_better(n6d, rms6d, best_n, best_rms):
-        best_model = m6d
-        best_n = n6d
-        best_rms = rms6d
-
-    # Phase E: Deep guided refinement.
-    # Extend slightly beyond the vmag<5 used in A-C to pick up a few more
-    # real stars, but not so deep that noise matches degrade the fit.
-    deep_mask = vmag_ext < 5.5
-    deep_az = cat_az[deep_mask]
-    deep_alt = cat_alt[deep_mask]
-    # Use a tighter search radius for Phase E since the model is already
-    # well-refined.  In dense star fields, a large radius grabs wrong stars.
-    phase_e_sr = max(12, min(30, int(best_rms * 2.5)))
-    m6e, n6e, rms6e = guided_refine(
-        image, deep_az, deep_alt, best_model,
-        n_iterations=15,
-        min_peak_offset=min_peak_offset,
-        alt_min_deg=5, alt_max_deg=88,
-        fix_az0=False,
-        fit_distortion=False,
-        horizon_r=hr, horizon_weight=1.0,
-        initial_search_radius=phase_e_sr,
-    )
-    if verbose:
-        r_h = _apply_distortion(
-            _theta_to_r(np.pi / 2, m6e.f, m6e.proj_type), m6e.k1, m6e.k2)
-        log.info(f"  Phase E (full guided): {n6e} matches, RMS={rms6e:.1f}, "
-                 f"f={m6e.f:.0f}, k1={m6e.k1:.2e}, "
-                 f"horizon={r_h:.0f}px")
-    if progress:
-        progress("refine_phase", phase="E", n_matches=n6e,
-                 rms=rms6e, f=m6e.f)
-
-    # Only adopt Phase E if RMS didn't degrade significantly
-    if n6e > best_n and rms6e <= best_rms * 1.15:
-        best_model = m6e
-        best_n = n6e
-        best_rms = rms6e
-
-    if progress:
-        progress("refine_done", n_matches=best_n, rms=best_rms,
-                 f=best_model.f)
-
-    # Phase F: Alternative projection (if Step 5b found one).
-    # First stabilize geometry (no distortion), then add distortion.
-    if alt_proj_seed is not None:
+        Returns (best_model, best_n, best_rms) for this pass.
+        """
+        bm = step6_init_best_model
+        bn = step6_init_best_n
+        br = step6_init_best_rms
         if verbose:
-            log.info(f"  Phase F (alt projection: "
-                     f"{alt_proj_seed.proj_type.value})")
-        # F.1: Geometry-only refinement to stabilize the model
-        mf_g, nf_g, rmsf_g = guided_refine(
-            image, med_az, med_alt, alt_proj_seed,
+            log.info(f"Step 6 [{tag}]: Geometry refinement "
+                     f"(fit_distortion={fit_distortion})")
+        if progress:
+            progress("refine_start", tag=tag)
+
+        # Phase A: Joint fit from analytical seed, mid-altitude
+        m6a, n6a, rms6a = guided_refine(
+            image, wide_az, wide_alt, seed,
             n_iterations=15,
             min_peak_offset=min_peak_offset,
             alt_min_deg=15, alt_max_deg=75,
-            fix_az0=True,
-            fit_distortion=False,
-            horizon_r=hr, horizon_weight=1.0,
-        )
-        # F.2: Add distortion fitting from the stabilized model
-        mf_a, nf_a, rmsf_a = guided_refine(
-            image, wide_az, wide_alt, mf_g,
-            n_iterations=15,
-            min_peak_offset=min_peak_offset,
-            alt_min_deg=10, alt_max_deg=80,
             fix_az0=near_zenith,
-            fit_distortion=False,
+            fit_distortion=fit_distortion,
             horizon_r=hr, horizon_weight=2.0,
         )
-        # F.3: Widen altitude range
-        mf_b, nf_b, rmsf_b = guided_refine(
-            image, wide_az, wide_alt, mf_a,
+        if verbose:
+            r_h = _apply_distortion(
+                _theta_to_r(np.pi / 2, m6a.f, m6a.proj_type),
+                m6a.k1, m6a.k2)
+            log.info(f"  [{tag}] Phase A (mid-alt): {n6a} matches, "
+                     f"RMS={rms6a:.1f}, f={m6a.f:.0f}, "
+                     f"k1={m6a.k1:.2e}, horizon={r_h:.0f}px")
+        if progress:
+            progress("refine_phase", tag=tag, phase="A",
+                     n_matches=n6a, rms=rms6a, f=m6a.f)
+
+        # Phase B: Broaden to include low-altitude stars
+        m6b, n6b, rms6b = guided_refine(
+            image, wide_az, wide_alt, m6a,
             n_iterations=15,
             min_peak_offset=min_peak_offset,
             alt_min_deg=5, alt_max_deg=88,
             fix_az0=near_zenith,
-            fit_distortion=False,
+            fit_distortion=fit_distortion,
+            horizon_r=hr, horizon_weight=2.0,
+        )
+        if verbose:
+            r_h = _apply_distortion(
+                _theta_to_r(np.pi / 2, m6b.f, m6b.proj_type),
+                m6b.k1, m6b.k2)
+            log.info(f"  [{tag}] Phase B (wide): {n6b} matches, "
+                     f"RMS={rms6b:.1f}, f={m6b.f:.0f}, "
+                     f"k1={m6b.k1:.2e}, horizon={r_h:.0f}px")
+        if progress:
+            progress("refine_phase", tag=tag, phase="B",
+                     n_matches=n6b, rms=rms6b, f=m6b.f)
+
+        # Phase C: Full-field final refinement
+        m6c, n6c, rms6c = guided_refine(
+            image, wide_az, wide_alt, m6b,
+            n_iterations=15,
+            min_peak_offset=min_peak_offset,
+            alt_min_deg=3, alt_max_deg=88,
+            fix_az0=near_zenith,
+            fit_distortion=fit_distortion,
             horizon_r=hr, horizon_weight=1.0,
         )
-        # F.4: Detection-based refinement
-        mf_d, nf_d, rmsf_d = detection_refine(
-            det_table, full_az, full_alt, mf_b,
+        if verbose:
+            r_h = _apply_distortion(
+                _theta_to_r(np.pi / 2, m6c.f, m6c.proj_type),
+                m6c.k1, m6c.k2)
+            log.info(f"  [{tag}] Phase C (full-field): {n6c} matches, "
+                     f"RMS={rms6c:.1f}, f={m6c.f:.0f}, "
+                     f"k1={m6c.k1:.2e}, horizon={r_h:.0f}px")
+        if progress:
+            progress("refine_phase", tag=tag, phase="C",
+                     n_matches=n6c, rms=rms6c, f=m6c.f)
+
+        # Pick the best of Phases A/B/C
+        for m_cand, n_cand, rms_cand in [(m6a, n6a, rms6a),
+                                          (m6b, n6b, rms6b),
+                                          (m6c, n6c, rms6c)]:
+            if _is_better(n_cand, rms_cand, bn, br):
+                bm = m_cand
+                bn = n_cand
+                br = rms_cand
+
+        # Phase D: Detection-based matching with full catalog.
+        m6d, n6d, rms6d = detection_refine(
+            det_table, full_az, full_alt, bm,
             n_iterations=20,
             alt_min_deg=3, alt_max_deg=88,
             fix_az0=near_zenith,
-            fit_distortion=False,
+            fit_distortion=fit_distortion,
             horizon_r=hr, horizon_weight=1.0,
         )
-        # Pick best from alt-projection phases
-        for m_cand, n_cand, rms_cand in [(mf_a, nf_a, rmsf_a),
-                                          (mf_b, nf_b, rmsf_b),
-                                          (mf_d, nf_d, rmsf_d)]:
-            if _is_better(n_cand, rms_cand, best_n, best_rms):
-                best_model = m_cand
-                best_n = n_cand
-                best_rms = rms_cand
         if verbose:
-            log.info(f"    geom: {nf_g} matches, RMS={rmsf_g:.1f}")
-            log.info(f"    +dist: {nf_a} matches, RMS={rmsf_a:.1f}, "
-                     f"f={mf_a.f:.0f}")
-            log.info(f"    wide: {nf_b} matches, RMS={rmsf_b:.1f}, "
-                     f"f={mf_b.f:.0f}")
-            log.info(f"    det:  {nf_d} matches, RMS={rmsf_d:.1f}, "
-                     f"f={mf_d.f:.0f}")
+            r_h = _apply_distortion(
+                _theta_to_r(np.pi / 2, m6d.f, m6d.proj_type),
+                m6d.k1, m6d.k2)
+            log.info(f"  [{tag}] Phase D (full catalog det): {n6d} "
+                     f"matches, RMS={rms6d:.1f}, f={m6d.f:.0f}, "
+                     f"k1={m6d.k1:.2e}, horizon={r_h:.0f}px")
+        if progress:
+            progress("refine_phase", tag=tag, phase="D",
+                     n_matches=n6d, rms=rms6d, f=m6d.f)
+
+        if _is_better(n6d, rms6d, bn, br):
+            bm = m6d
+            bn = n6d
+            br = rms6d
+
+        # Phase E: Deep guided refinement.
+        deep_mask = vmag_ext < 5.5
+        deep_az = cat_az[deep_mask]
+        deep_alt = cat_alt[deep_mask]
+        phase_e_sr = max(12, min(30, int(br * 2.5)))
+        m6e, n6e, rms6e = guided_refine(
+            image, deep_az, deep_alt, bm,
+            n_iterations=15,
+            min_peak_offset=min_peak_offset,
+            alt_min_deg=5, alt_max_deg=88,
+            fix_az0=False,
+            fit_distortion=fit_distortion,
+            horizon_r=hr, horizon_weight=1.0,
+            initial_search_radius=phase_e_sr,
+        )
+        if verbose:
+            r_h = _apply_distortion(
+                _theta_to_r(np.pi / 2, m6e.f, m6e.proj_type),
+                m6e.k1, m6e.k2)
+            log.info(f"  [{tag}] Phase E (full guided): {n6e} matches, "
+                     f"RMS={rms6e:.1f}, f={m6e.f:.0f}, "
+                     f"k1={m6e.k1:.2e}, horizon={r_h:.0f}px")
+        if progress:
+            progress("refine_phase", tag=tag, phase="E",
+                     n_matches=n6e, rms=rms6e, f=m6e.f)
+
+        # Only adopt Phase E if RMS didn't degrade significantly
+        if n6e > bn and rms6e <= br * 1.15:
+            bm = m6e
+            bn = n6e
+            br = rms6e
+
+        if progress:
+            progress("refine_done", tag=tag,
+                     n_matches=bn, rms=br, f=bm.f)
+
+        # Phase F: Alternative projection (if Step 5b found one).
+        if alt_seed is not None:
+            if verbose:
+                log.info(f"  [{tag}] Phase F (alt projection: "
+                         f"{alt_seed.proj_type.value})")
+            # F.1: Geometry-only refinement to stabilize the model
+            mf_g, nf_g, rmsf_g = guided_refine(
+                image, med_az, med_alt, alt_seed,
+                n_iterations=15,
+                min_peak_offset=min_peak_offset,
+                alt_min_deg=15, alt_max_deg=75,
+                fix_az0=True,
+                fit_distortion=fit_distortion,
+                horizon_r=hr, horizon_weight=1.0,
+            )
+            # F.2: from stabilized model
+            mf_a, nf_a, rmsf_a = guided_refine(
+                image, wide_az, wide_alt, mf_g,
+                n_iterations=15,
+                min_peak_offset=min_peak_offset,
+                alt_min_deg=10, alt_max_deg=80,
+                fix_az0=near_zenith,
+                fit_distortion=fit_distortion,
+                horizon_r=hr, horizon_weight=2.0,
+            )
+            # F.3: Widen altitude range
+            mf_b, nf_b, rmsf_b = guided_refine(
+                image, wide_az, wide_alt, mf_a,
+                n_iterations=15,
+                min_peak_offset=min_peak_offset,
+                alt_min_deg=5, alt_max_deg=88,
+                fix_az0=near_zenith,
+                fit_distortion=fit_distortion,
+                horizon_r=hr, horizon_weight=1.0,
+            )
+            # F.4: Detection-based refinement
+            mf_d, nf_d, rmsf_d = detection_refine(
+                det_table, full_az, full_alt, mf_b,
+                n_iterations=20,
+                alt_min_deg=3, alt_max_deg=88,
+                fix_az0=near_zenith,
+                fit_distortion=fit_distortion,
+                horizon_r=hr, horizon_weight=1.0,
+            )
+            for m_cand, n_cand, rms_cand in [(mf_a, nf_a, rmsf_a),
+                                              (mf_b, nf_b, rmsf_b),
+                                              (mf_d, nf_d, rmsf_d)]:
+                if _is_better(n_cand, rms_cand, bn, br):
+                    bm = m_cand
+                    bn = n_cand
+                    br = rms_cand
+            if verbose:
+                log.info(f"    [{tag}] geom: {nf_g} matches, "
+                         f"RMS={rmsf_g:.1f}")
+                log.info(f"    [{tag}] +dist: {nf_a} matches, "
+                         f"RMS={rmsf_a:.1f}, f={mf_a.f:.0f}")
+                log.info(f"    [{tag}] wide: {nf_b} matches, "
+                         f"RMS={rmsf_b:.1f}, f={mf_b.f:.0f}")
+                log.info(f"    [{tag}] det:  {nf_d} matches, "
+                         f"RMS={rmsf_d:.1f}, f={mf_d.f:.0f}")
+
+        return bm, bn, br
+
+    # Pass 1: k1 forced to zero
+    k0_seed = CameraModel(
+        cx=step5_dist_seed.cx, cy=step5_dist_seed.cy,
+        az0=step5_dist_seed.az0, alt0=step5_dist_seed.alt0,
+        rho=step5_dist_seed.rho, f=step5_dist_seed.f,
+        proj_type=step5_dist_seed.proj_type,
+        k1=0.0, k2=0.0,
+    )
+    k0_alt = None
+    if step5_alt_seed is not None:
+        k0_alt = CameraModel(
+            cx=step5_alt_seed.cx, cy=step5_alt_seed.cy,
+            az0=step5_alt_seed.az0, alt0=step5_alt_seed.alt0,
+            rho=step5_alt_seed.rho, f=step5_alt_seed.f,
+            proj_type=step5_alt_seed.proj_type,
+            k1=0.0, k2=0.0,
+        )
+    m_k0, n_k0, rms_k0 = _run_step_6_phases(
+        k0_seed, k0_alt, fit_distortion=False, tag="k0")
+
+    # Pass 2: k1 free, seeded from Step 5a's two-constraint estimate
+    m_k1, n_k1, rms_k1 = _run_step_6_phases(
+        step5_dist_seed, step5_alt_seed, fit_distortion=True, tag="k1")
+
+    # Pick the winner. Prefer no-distortion ties (Occam).
+    if _is_better(n_k1, rms_k1, n_k0, rms_k0):
+        best_model, best_n, best_rms = m_k1, n_k1, rms_k1
+        step6_winner = "k1"
+    else:
+        best_model, best_n, best_rms = m_k0, n_k0, rms_k0
+        step6_winner = "k0"
+    if verbose:
+        log.info(f"Step 6 result: {step6_winner} won  "
+                 f"(k0: {n_k0} matches/{rms_k0:.2f}px,  "
+                 f"k1: {n_k1} matches/{rms_k1:.2f}px, "
+                 f"k1_final={best_model.k1:.2e})")
+    diag["step6_k0_n"] = n_k0
+    diag["step6_k0_rms"] = rms_k0
+    diag["step6_k1_n"] = n_k1
+    diag["step6_k1_rms"] = rms_k1
+    diag["step6_winner"] = step6_winner
 
     # --- Step 6c: Score-map sweep backup ---
     # When the pattern-match pipeline couldn't solve the camera (weak
