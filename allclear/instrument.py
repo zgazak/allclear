@@ -41,8 +41,10 @@ class InstrumentModel:
     roll_deg: float = 0.0
     k1: float = 0.0
     k2: float = 0.0
-    image_width: int = 3096
-    image_height: int = 2080
+    # Default 0 = "unspecified" sentinel so a forgotten kwarg fails loudly
+    # downstream rather than silently inheriting AAI camera dimensions.
+    image_width: int = 0
+    image_height: int = 0
     mirrored: bool = False  # True if image is E-W flipped
 
     # --- Detection settings (reused in solve mode) ---
@@ -196,8 +198,8 @@ class InstrumentModel:
             roll_deg=cam.get("roll_deg", 0.0),
             k1=cam.get("k1", 0.0),
             k2=cam.get("k2", 0.0),
-            image_width=cam.get("image_width", 3096),
-            image_height=cam.get("image_height", 2080),
+            image_width=cam.get("image_width", 0),
+            image_height=cam.get("image_height", 0),
             mirrored=cam.get("mirrored", False),
             detection_fwhm=det.get("fwhm", 5.0),
             detection_threshold_sigma=det.get("threshold_sigma", 5.0),
