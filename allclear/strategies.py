@@ -3483,46 +3483,50 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
 
         return bm, bn, br
 
-    # Pass 1: k1 forced to zero
-    k0_seed = CameraModel(
-        cx=step5_dist_seed.cx, cy=step5_dist_seed.cy,
-        az0=step5_dist_seed.az0, alt0=step5_dist_seed.alt0,
-        rho=step5_dist_seed.rho, f=step5_dist_seed.f,
-        proj_type=step5_dist_seed.proj_type,
-        k1=0.0, k2=0.0,
-    )
-    k0_alt = None
-    if step5_alt_seed is not None:
-        k0_alt = CameraModel(
-            cx=step5_alt_seed.cx, cy=step5_alt_seed.cy,
-            az0=step5_alt_seed.az0, alt0=step5_alt_seed.alt0,
-            rho=step5_alt_seed.rho, f=step5_alt_seed.f,
-            proj_type=step5_alt_seed.proj_type,
-            k1=0.0, k2=0.0,
-        )
-    m_k0, n_k0, rms_k0 = _run_step_6_phases(
-        k0_seed, k0_alt, fit_distortion=False, tag="k0")
-
-    # Pass 2: k1 free, seeded from Step 5a's two-constraint estimate
+    # Pass 1 (always): k1 free, seeded from Step 5a's two-constraint
+    # estimate.  This is the pre-flex behavior — known good, with the
+    # quality gates (high RMS, k1 hits bound) correctly catching
+    # cloudy-frame failures.
     m_k1, n_k1, rms_k1 = _run_step_6_phases(
         step5_dist_seed, step5_alt_seed, fit_distortion=True, tag="k1")
+    best_model, best_n, best_rms = m_k1, n_k1, rms_k1
+    step6_winner = "k1"
 
-    # Pick the winner. Prefer no-distortion ties (Occam).
-    if _is_better(n_k1, rms_k1, n_k0, rms_k0):
-        best_model, best_n, best_rms = m_k1, n_k1, rms_k1
-        step6_winner = "k1"
+    # Pass 2 (verification): try k1=0 starting from the k1-converged
+    # geometry.  Only accept if it materially improves on the k1 result
+    # — strict criterion so we never trade a real solve for a wrong
+    # basin.  Most cameras need k1; some (small-f, no real distortion)
+    # genuinely don't and benefit from removing the extra degree of
+    # freedom.
+    if abs(m_k1.k1) > 0 or abs(m_k1.k2) > 0:
+        k0_seed = CameraModel(
+            cx=m_k1.cx, cy=m_k1.cy,
+            az0=m_k1.az0, alt0=m_k1.alt0,
+            rho=m_k1.rho, f=m_k1.f,
+            proj_type=m_k1.proj_type,
+            k1=0.0, k2=0.0,
+        )
+        m_k0, n_k0, rms_k0 = _run_step_6_phases(
+            k0_seed, None, fit_distortion=False, tag="k0_test")
+        # Accept k0 only if it clearly wins: at least as many matches
+        # AND lower RMS (no marginal-improvement trades).
+        if n_k0 >= n_k1 and rms_k0 < rms_k1:
+            best_model, best_n, best_rms = m_k0, n_k0, rms_k0
+            step6_winner = "k0"
     else:
-        best_model, best_n, best_rms = m_k0, n_k0, rms_k0
-        step6_winner = "k0"
+        m_k0, n_k0, rms_k0 = m_k1, n_k1, rms_k1  # not tested
+
     if verbose:
         log.info(f"Step 6 result: {step6_winner} won  "
-                 f"(k0: {n_k0} matches/{rms_k0:.2f}px,  "
-                 f"k1: {n_k1} matches/{rms_k1:.2f}px, "
+                 f"(k1-pass: {n_k1} matches/{rms_k1:.2f}px,  "
+                 f"k0-test: {n_k0} matches/{rms_k0:.2f}px, "
                  f"k1_final={best_model.k1:.2e})")
     diag["step6_k0_n"] = n_k0
     diag["step6_k0_rms"] = rms_k0
+    diag["step6_k0_f"] = m_k0.f
     diag["step6_k1_n"] = n_k1
     diag["step6_k1_rms"] = rms_k1
+    diag["step6_k1_f"] = m_k1.f
     diag["step6_winner"] = step6_winner
 
     # --- Step 6c: Score-map sweep backup ---
