@@ -603,9 +603,11 @@ def cmd_solve(args):
 
             # Per-frame model JSON (lightweight — solved geometry + zeropoint)
             model_path = str(out_base) + "_model.json"
+            ny_img, nx_img = data.shape
             frame_inst = InstrumentModel.from_camera_model(
                 result.camera_model,
                 site_lat=inst.site_lat, site_lon=inst.site_lon,
+                image_width=nx_img, image_height=ny_img,
                 mirrored=inst.mirrored,
                 photometric_zeropoint=zp,
                 n_stars_matched=result.n_matched,
