@@ -139,7 +139,7 @@ class BrightStarCatalog:
         return out
 
     def get_visible_stars(self, lat_deg, lon_deg, obs_time, alt_limit=5.0,
-                          response_k=0.20):
+                          response_k=0.20, apply_refraction=True):
         """Return catalog stars visible from the given location and time.
 
         Parameters
@@ -173,10 +173,25 @@ class BrightStarCatalog:
             warnings.simplefilter("ignore")
             altaz = coords.transform_to(frame)
 
-        alt_deg_arr = altaz.alt.deg
+        alt_true_arr = altaz.alt.deg
         az_deg_arr = altaz.az.deg
 
-        mask = alt_deg_arr >= alt_limit
+        # Atmospheric refraction lifts apparent altitude.  The camera
+        # senses stars at their APPARENT positions, so the catalog
+        # column "alt_deg" stores apparent altitude — that is what the
+        # projection geometry must match.  True altitude (used for
+        # airmass and extinction) is preserved as "alt_true_deg".
+        if apply_refraction:
+            from .projection import _saemundsson_refraction
+            R_rad = _saemundsson_refraction(np.radians(alt_true_arr))
+            alt_apparent_arr = alt_true_arr + np.degrees(R_rad)
+        else:
+            alt_apparent_arr = alt_true_arr
+
+        # Filter on TRUE altitude so the cut isn't pushed up by
+        # refraction (a star at true alt=4.8° would otherwise sneak
+        # past a 5° apparent cut).
+        mask = alt_true_arr >= alt_limit
 
         out = Table()
         out["hip_id"] = cat["hip_id"][mask]
@@ -184,8 +199,11 @@ class BrightStarCatalog:
         out["dec_deg"] = cat["dec_deg"][mask]
         out["vmag"] = cat["vmag"][mask]
         out["az_deg"] = az_deg_arr[mask]
-        out["alt_deg"] = alt_deg_arr[mask]
-        out["airmass"] = airmass_bemporad(np.radians(alt_deg_arr[mask]))
+        out["alt_deg"] = alt_apparent_arr[mask]
+        out["alt_true_deg"] = alt_true_arr[mask]
+        # Airmass + extinction use true altitude (Bemporad's formula
+        # is calibrated against geometric path length).
+        out["airmass"] = airmass_bemporad(np.radians(alt_true_arr[mask]))
         out["vmag_expected"] = expected_apparent_mag(
             out["vmag"], out["airmass"], k=response_k
         )

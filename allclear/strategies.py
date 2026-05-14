@@ -962,6 +962,89 @@ def _guided_match(image, model, cat_az, cat_alt, search_radius, min_peak,
     return matches
 
 
+def _displacement_field_filter(det_x, det_y, px, py,
+                               k_neighbors=10, threshold_mad=3.0,
+                               max_neighbor_dist=300.0,
+                               min_neighbors=4):
+    """Reject matches whose residual VECTOR disagrees with neighbors.
+
+    Star matches form a smoothly-varying displacement field across the
+    image (model bias varies with altitude/azimuth, but adjacent matches
+    should share the same drift).  A wrong cat->det assignment produces
+    a residual vector whose direction and/or magnitude differs from its
+    neighbors — a scalar |residual| test misses this when the wrong-pair
+    distance happens to fall near the typical residual scale.
+
+    For each match, compute the local median residual vector from its
+    nearest neighbors in pixel space, restricted to a radius so that
+    sparse outer-edge matches aren't compared against mid-radius
+    neighbors with different bias.  Flag matches whose deviation from
+    the local median exceeds ``threshold_mad`` multiples of the global
+    MAD of deviations.  Matches with fewer than ``min_neighbors`` true
+    local neighbors are kept (filter has insufficient evidence to reject).
+
+    Parameters
+    ----------
+    det_x, det_y : ndarray
+        Detected pixel positions.
+    px, py : ndarray
+        Model-projected catalog pixel positions for the same matches.
+    k_neighbors : int
+        Maximum neighbors used to estimate the local displacement.
+    threshold_mad : float
+        Reject if deviation magnitude > threshold * MAD(deviations).
+    max_neighbor_dist : float
+        Neighbors farther than this (pixels) are ignored — prevents
+        sparse low-altitude matches from being judged against bright
+        mid-altitude neighbors with different residual bias.
+    min_neighbors : int
+        If a match has fewer than this many local neighbors within
+        ``max_neighbor_dist``, give it a pass.
+
+    Returns
+    -------
+    inlier_mask : ndarray of bool
+        True for matches to keep.
+    """
+    n = len(det_x)
+    if n < min_neighbors + 1:
+        return np.ones(n, dtype=bool)
+    dx = det_x - px
+    dy = det_y - py
+    pts = np.column_stack([px, py])
+    tree = KDTree(pts)
+    # Query k_neighbors+1 nearest with distance cap; missing positions
+    # come back as inf distance / index n.
+    dists, idx = tree.query(pts, k=min(k_neighbors + 1, n),
+                            distance_upper_bound=max_neighbor_dist)
+    keep = np.ones(n, dtype=bool)
+    # MAD precomputed across all matches that have enough neighbors
+    deviations = np.full(n, np.nan)
+    for i in range(n):
+        # Drop self (first hit) and out-of-range entries (dist=inf, idx=n)
+        valid = (idx[i] < n) & (idx[i] != i)
+        if np.sum(valid) < min_neighbors:
+            continue
+        neigh = idx[i][valid]
+        loc_x = np.median(dx[neigh])
+        loc_y = np.median(dy[neigh])
+        deviations[i] = np.sqrt((dx[i] - loc_x) ** 2 +
+                                (dy[i] - loc_y) ** 2)
+    finite = np.isfinite(deviations)
+    if finite.sum() < min_neighbors:
+        return keep
+    mad = np.median(deviations[finite])
+    if mad < 1e-6:
+        thr = max(3.0, threshold_mad)
+    else:
+        thr = threshold_mad * mad
+    # Reject only those with computed deviations exceeding threshold;
+    # matches without enough neighbors (nan deviation) pass through.
+    reject = finite & (deviations > thr)
+    keep[reject] = False
+    return keep
+
+
 def _fit_model_to_pairs(det_x, det_y, cat_az, cat_alt, model,
                         fit_distortion=False, fix_az0=False,
                         horizon_r=None, horizon_weight=1.0):
@@ -1224,10 +1307,15 @@ def _is_better(n_new, rms_new, n_old, rms_old, rms_threshold=7.0,
         if rms_new > rms_threshold and rms_new > rms_old * 1.3:
             return False
 
-    # Quality score: n_matched / (1 + rms²) — quadratic RMS penalty
-    # discourages trading precision for match count.
-    score_new = n_new / (1.0 + rms_new * rms_new)
-    score_old = n_old / (1.0 + rms_old * rms_old)
+    # Quality score: n_matched / (1 + rms) — linear RMS penalty.
+    # The quadratic form previously here over-rewarded tiny high-precision
+    # subsets: 111 matches at 0.7px RMS would beat 397 matches at 3.3px,
+    # locking blind solve into a low-altitude-cluster basin even when
+    # later phases found a more comprehensive fit.  Linear gives those
+    # later phases room to win without admitting Phase-D-style false-
+    # positive contamination (rms_threshold + rms_reject still gate that).
+    score_new = n_new / (1.0 + rms_new)
+    score_old = n_old / (1.0 + rms_old)
     return score_new > score_old
 
 
@@ -1655,15 +1743,18 @@ def guided_refine(image, cat_az, cat_alt, model, n_iterations=12,
         cat_az_m = np.array([cat_az[m[0]] for m in matches])
         cat_alt_m = np.array([cat_alt[m[0]] for m in matches])
 
-        # Sigma-clip outlier matches — essential in dense star fields
-        # where the nearest local maximum may be a different star.
-        if len(matches) > 10:
+        # Vector-field consistency filter — a match whose residual
+        # disagrees with its neighbors' residual vectors (in magnitude
+        # and direction) is almost certainly a wrong cat→det assignment.
+        # Replaces a prior scalar-magnitude sigma-clip that missed
+        # mispairs whose offset happened to fall near the typical
+        # residual scale.
+        if len(matches) > 12:
             px_pre, py_pre = current.sky_to_pixel(cat_az_m, cat_alt_m)
-            resid = np.sqrt((px_pre - det_x_m) ** 2 +
-                            (py_pre - det_y_m) ** 2)
-            med_r = np.median(resid)
-            clip_threshold = max(10.0, med_r + 2.5 * np.std(resid))
-            good = resid < clip_threshold
+            good = _displacement_field_filter(
+                det_x_m, det_y_m, px_pre, py_pre,
+                k_neighbors=10, threshold_mad=3.0,
+            )
             if np.sum(good) >= 6:
                 det_x_m = det_x_m[good]
                 det_y_m = det_y_m[good]
@@ -1760,6 +1851,19 @@ def detection_refine(det_table, cat_az, cat_alt, model, n_iterations=12,
         cat_az_m = np.array([use_az[ci] for di, ci in pairs])
         cat_alt_m = np.array([use_alt[ci] for di, ci in pairs])
 
+        # Vector-field consistency filter (see _displacement_field_filter)
+        if len(pairs) > 12:
+            px_pre, py_pre = current.sky_to_pixel(cat_az_m, cat_alt_m)
+            good = _displacement_field_filter(
+                det_x_m, det_y_m, px_pre, py_pre,
+                k_neighbors=10, threshold_mad=3.0,
+            )
+            if np.sum(good) >= 6:
+                det_x_m = det_x_m[good]
+                det_y_m = det_y_m[good]
+                cat_az_m = cat_az_m[good]
+                cat_alt_m = cat_alt_m[good]
+
         try:
             current = _fit_model_to_pairs(
                 det_x_m, det_y_m, cat_az_m, cat_alt_m, current,
@@ -1769,7 +1873,7 @@ def detection_refine(det_table, cat_az, cat_alt, model, n_iterations=12,
         except Exception:
             break
 
-        n_matched = len(pairs)
+        n_matched = len(det_x_m)
         px_fit, py_fit = current.sky_to_pixel(cat_az_m, cat_alt_m)
         rms = float(np.sqrt(np.mean(
             (px_fit - det_x_m) ** 2 + (py_fit - det_y_m) ** 2
