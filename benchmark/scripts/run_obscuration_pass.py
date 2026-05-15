@@ -21,7 +21,9 @@ Run:
 """
 from __future__ import annotations
 
+import argparse
 import csv
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -41,6 +43,23 @@ OUT_CSV = Path("benchmark/results/obscuration/per_star_observations.csv")
 VMAG_LIMIT = 6.5
 ALT_MIN = 5.0
 THRESHOLD = 0.7
+
+
+def _process_one(args):
+    """Worker entry: load catalog locally, call process_frame.
+
+    Catalog can't be pickled efficiently, so each worker loads it once.
+    """
+    frame_path, model_path = args
+    # Cache catalog as module attribute so each worker loads it only once.
+    cat = getattr(_process_one, "_cat", None)
+    if cat is None:
+        cat = BrightStarCatalog()
+        _process_one._cat = cat
+    try:
+        return frame_path, model_path, process_frame(frame_path, model_path, cat), None
+    except Exception as e:
+        return frame_path, model_path, None, f"{type(e).__name__}: {e}"
 
 
 def process_frame(frame_path, model_path, cat):
@@ -114,42 +133,53 @@ def process_frame(frame_path, model_path, cat):
 
 
 def main(argv=None):
-    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    cat = BrightStarCatalog()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--jobs", "-j", type=int, default=1,
+                        help="Number of parallel workers (default 1).")
+    args = parser.parse_args(argv)
 
+    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     fields = ["frame", "hip_idx", "vmag", "az_deg", "alt_deg",
               "pixel_x", "pixel_y", "detected", "clear_fraction"]
 
-    # Stream results to CSV as we go
+    model_files = sorted(MODELS_DIR.glob("*_model.json"))
+    work = []
+    for model_path in model_files:
+        stem = model_path.name.replace("_model.json", "")
+        frame_path = FRAMES_DIR / f"{stem}.fits"
+        if frame_path.exists():
+            work.append((frame_path, model_path))
+
+    print(f"Processing {len(work)} frames with {args.jobs} worker(s)...",
+          flush=True)
+
+    n_frames_ok = 0
+    n_rows = 0
     with OUT_CSV.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-
-        model_files = sorted(MODELS_DIR.glob("*_model.json"))
-        n_frames = 0
-        n_frames_ok = 0
-        n_rows = 0
-        for i, model_path in enumerate(model_files):
-            stem = model_path.name.replace("_model.json", "")
-            frame_path = FRAMES_DIR / f"{stem}.fits"
-            if not frame_path.exists():
+        if args.jobs > 1:
+            pool = multiprocessing.Pool(args.jobs)
+            iterator = pool.imap_unordered(_process_one, work, chunksize=1)
+        else:
+            iterator = (_process_one(w) for w in work)
+        for i, (frame_path, _, rows, err) in enumerate(iterator):
+            if err:
+                print(f"  [{i+1}/{len(work)}] {frame_path.name}: "
+                      f"EXCEPTION {err}", flush=True)
                 continue
-            try:
-                rows = process_frame(frame_path, model_path, cat)
-            except Exception as e:
-                print(f"  [{i+1}/{len(model_files)}] {frame_path.name}: "
-                      f"EXCEPTION {type(e).__name__}: {e}", flush=True)
-                continue
-            n_frames += 1
             if rows is None:
                 continue
             writer.writerows(rows)
             n_frames_ok += 1
             n_rows += len(rows)
-            if (i + 1) % 10 == 0 or (i + 1) == len(model_files):
-                print(f"  [{i+1}/{len(model_files)}] ok_frames={n_frames_ok}"
-                      f" rows={n_rows}  clear={rows[0]['clear_fraction']:.2f}"
+            if (i + 1) % 10 == 0 or (i + 1) == len(work):
+                cf = rows[0]['clear_fraction'] if rows else float('nan')
+                print(f"  [{i+1}/{len(work)}] ok_frames={n_frames_ok}"
+                      f" rows={n_rows}  clear={cf:.2f}"
                       f" n_stars={len(rows)}", flush=True)
+        if args.jobs > 1:
+            pool.close(); pool.join()
 
     print(f"\nDone. {n_frames_ok} frames, {n_rows} star observations.")
     print(f"Wrote: {OUT_CSV}")
