@@ -2001,13 +2001,69 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
             yi_e = cy_est + r_edge * dy
             grad_points.append((float(xi_e), float(yi_e)))
 
-    # Fit circles from both methods with iterative outlier rejection.
+    # --- Method 3: Outer envelope (scan inward) ---
+    # For each ray, find the outermost radius where smoothed brightness
+    # is still above the sky/dark threshold.  Telescope domes and
+    # buildings only intrude INWARD of the true horizon, never beyond
+    # it, so the outer envelope of bright pixels is the true horizon
+    # even when interior obstructions dominate the per-ray gradient.
+    env_points = []
+    for angle in angles:
+        dx, dy = np.cos(angle), np.sin(angle)
+        radii_ray = []
+        vals_ray = []
+        for r in np.arange(r_min, r_max, step):
+            xi = int(round(cx_est + r * dx))
+            yi = int(round(cy_est + r * dy))
+            if xi < 3 or xi >= nx - 3 or yi < 3 or yi >= ny - 3:
+                break
+            val = float(np.median(img[yi - 2:yi + 3, xi - 2:xi + 3]))
+            radii_ray.append(r)
+            vals_ray.append(val)
+
+        if len(vals_ray) < 10:
+            continue
+        radii_arr = np.array(radii_ray)
+        vals_arr = np.array(vals_ray)
+        from scipy.ndimage import uniform_filter1d
+        smooth_vals = uniform_filter1d(vals_arr, size=7)
+
+        above = smooth_vals > threshold
+        if not np.any(above):
+            continue
+        last_idx = int(np.where(above)[0].max())
+        # If the ray exits the image frame while still bright, the
+        # horizon isn't visible along this ray — skip rather than
+        # anchoring to the image edge.
+        if last_idx >= len(smooth_vals) - 2:
+            continue
+        # Sub-sample refine: linearly interpolate the threshold crossing
+        # between last_idx (above) and last_idx+1 (below).
+        v_in = smooth_vals[last_idx]
+        v_out = smooth_vals[last_idx + 1]
+        if (v_in - v_out) > 1e-6:
+            frac = (v_in - threshold) / (v_in - v_out)
+            r_edge = float(radii_arr[last_idx]
+                           + frac * (radii_arr[last_idx + 1]
+                                     - radii_arr[last_idx]))
+        else:
+            r_edge = float(radii_arr[last_idx])
+        xi_e = cx_est + r_edge * dx
+        yi_e = cy_est + r_edge * dy
+        env_points.append((float(xi_e), float(yi_e)))
+
+    # Fit circles from all three methods with iterative outlier rejection.
     # Buildings/structures intrude into the sky circle, pulling boundary
     # points inward.  We iteratively fit, reject points far INSIDE the
-    # circle (these hit obstructions), and refit.
+    # circle (these hit obstructions), and refit.  The envelope method
+    # is fit with an outward-biased one-sided rejection so its result
+    # hugs the outer perimeter of the bright disc.
     results = []
-    for label, points in [("threshold", thresh_points),
-                          ("gradient", grad_points)]:
+    for label, points, side in [
+        ("threshold", thresh_points, "symmetric"),
+        ("gradient", grad_points, "symmetric"),
+        ("envelope", env_points, "outward"),
+    ]:
         if len(points) < 10:
             continue
         bp = np.array(points)
@@ -2026,9 +2082,14 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
             # (buildings/obstructions).  Keep points near or outside.
             dists = np.sqrt((bx - cx_f)**2 + (by - cy_f)**2)
             residuals = dists - R_f  # negative = inside circle
-            # Keep points within 1 sigma of the circle or outside it
             sigma = float(np.std(residuals))
-            keep = residuals > -1.5 * sigma
+            if side == "outward":
+                # Aggressive interior rejection (dome stragglers),
+                # modest exterior rejection (lights, image-edge noise).
+                keep = (residuals > -0.5 * sigma) & (residuals < 2.0 * sigma)
+            else:
+                # Keep points within 1.5 sigma of the circle or outside it
+                keep = residuals > -1.5 * sigma
             if np.sum(keep) < 10:
                 break
             bp = bp[keep]
