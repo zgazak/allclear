@@ -217,7 +217,11 @@ def _draw_altaz_grid(ax, camera_model, nx, ny):
     n_samples = 200
     fs = _font_size(np.empty((ny, nx)))
 
-    alt_circles_deg = [10, 20, 30, 45, 60, 80]
+    # alt=0° is rendered as a distinct yellow solid ring so it can be
+    # visually compared against the blue-dashed observed dome boundary
+    # (the model's projected horizon should sit on the observed one if
+    # the horizon penalty did its job).
+    alt_circles_deg = [0, 10, 20, 30, 45, 60, 80]
     az_lines_deg = [0, 45, 90, 135, 180, 225, 270, 315]
     cardinal_names = {0: "N", 45: "NE", 90: "E", 135: "SE",
                       180: "S", 225: "SW", 270: "W", 315: "NW"}
@@ -244,8 +248,14 @@ def _draw_altaz_grid(ax, camera_model, nx, ny):
 
         # Break line at large jumps (wrapping artifacts)
         xv, yv = x[valid], y[valid]
-        _plot_segments(ax, xv, yv, nx, color="white", linestyle="--",
-                       alpha=0.6, linewidth=1.0)
+        if alt_deg == 0:
+            # Model's projected horizon — yellow solid for contrast
+            # against the observed dome (blue dashed).
+            _plot_segments(ax, xv, yv, nx, color="#ffd400",
+                           linestyle="-", alpha=0.85, linewidth=1.6)
+        else:
+            _plot_segments(ax, xv, yv, nx, color="white", linestyle="--",
+                           alpha=0.6, linewidth=1.0)
 
         # Label at one in-frame point
         in_frame = (xv >= 0) & (xv < nx) & (yv >= 0) & (yv < ny)
