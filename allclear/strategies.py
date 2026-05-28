@@ -1086,13 +1086,19 @@ def _fit_model_to_pairs(det_x, det_y, cat_az, cat_alt, model,
 
     # Compute physically meaningful distortion bounds based on focal length.
     # At r = f (zenith angle ~1 rad), we want |k1*r^2| < 0.3 and |k2*r^4| < 0.15
-    # Fisheye lenses typically have barrel distortion (k1 ≤ 0) with equidistant
-    # projection, but lenses following equisolid or stereographic mappings
-    # appear slightly pincushion relative to equidistant.  Allow small positive
-    # k1 (up to 10% of k1_max) to handle these cases.
+    # Fisheye lenses are strictly barrel (k1 ≤ 0) under equidistant projection.
+    # For stereographic/equisolid projections (Step 5b switches to these when
+    # equidistant horizon mismatch is large), a slight pincushion (positive k1)
+    # can appear as the projection-class adjustment.  Equidistant must not drift
+    # positive — on sparse / cloudy frames or from biased seeds, the optimizer
+    # can otherwise reach a wide-net positive-k1 basin with many marginal
+    # matches and high RMS, losing the true canonical basin.
     f0 = model.f
     k1_max = 0.3 / (f0 * f0)          # typically ~2.5e-7 for f=1100
-    k1_hi = k1_max * 0.1              # allow slight pincushion
+    if proj_type == ProjectionType.EQUIDISTANT:
+        k1_hi = 0.0
+    else:
+        k1_hi = k1_max * 0.1          # slight pincushion for non-equidistant
     k2_max = 0.15 / (f0 ** 4)          # typically ~1e-13 for f=1100
 
     if fit_distortion:
@@ -4058,6 +4064,97 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                      sweep_n=int(sweep_val * sweep_n_if),
                      sweep_total=sweep_n_if,
                      winner=winner)
+
+    # --- Step 6r: Rescue pass for stuck-basin failures ---
+    # If the main pipeline produced a low-quality solve (bright-star
+    # match rate below the gate threshold), the optimiser is likely
+    # stuck in a wrong basin: typically pm_model handed forward a
+    # too-aggressive k1 from its Phase-3 refinement, which biases
+    # mid-altitude predictions by 30+ px and prevents downstream
+    # phases from reaching the canonical fit even though enough star
+    # signal is available.
+    #
+    # Recipe: reset k1=0 on the pm_model, run Phase A with a wide
+    # initial_search_radius=40 (catches stars that pm's biased k1
+    # placed too-far-from-truth), then Phase B + detection refine
+    # with horizon penalty disabled so the optimiser is driven by
+    # star residuals only.  Bright-star match rate decides whether
+    # the rescue replaces the main result.
+    def _bright_match_rate(model, vmag_cut=3.0):
+        sel = ((vmag_ext < vmag_cut)
+               & (cat_alt > np.radians(10))
+               & (cat_alt < np.radians(85)))
+        if int(np.sum(sel)) < 20:
+            return None
+        sa, st = cat_az[sel], cat_alt[sel]
+        sm = _guided_match(
+            image, model, sa, st,
+            search_radius=8,
+            min_peak=background + min_peak_offset,
+            background=background,
+        )
+        sx, sy = model.sky_to_pixel(sa, st)
+        inf = ((sx > 20) & (sx < nx - 20)
+               & (sy > 20) & (sy < ny - 20))
+        nif = int(np.sum(inf))
+        return (len(sm), nif, len(sm) / max(nif, 1))
+
+    main_v3 = _bright_match_rate(best_model)
+    diag["main_v3"] = main_v3[2] if main_v3 else None
+    if (main_v3 is not None and main_v3[2] < 0.70
+            and pm_model is not None and pm_n >= 30):
+        if verbose:
+            log.info(f"Step 6r: Rescue (main v<3={main_v3[2]:.0%} below gate)")
+        rescue_seed = CameraModel(
+            cx=pm_model.cx, cy=pm_model.cy,
+            az0=pm_model.az0, alt0=pm_model.alt0, rho=pm_model.rho,
+            f=pm_model.f, proj_type=pm_model.proj_type,
+            k1=0.0, k2=0.0,
+        )
+        try:
+            r_a, _, _ = guided_refine(
+                image, wide_az, wide_alt, rescue_seed,
+                n_iterations=20,
+                min_peak_offset=min_peak_offset,
+                alt_min_deg=15, alt_max_deg=75,
+                fix_az0=near_zenith, fit_distortion=True,
+                horizon_r=None, horizon_weight=0.0,
+                initial_search_radius=40,
+            )
+            r_b, _, _ = guided_refine(
+                image, wide_az, wide_alt, r_a,
+                n_iterations=15,
+                min_peak_offset=min_peak_offset,
+                alt_min_deg=5, alt_max_deg=88,
+                fix_az0=near_zenith, fit_distortion=True,
+                horizon_r=None, horizon_weight=0.0,
+                initial_search_radius=20,
+            )
+            r_d, r_nd, r_rd = detection_refine(
+                det_table, full_az, full_alt, r_b,
+                n_iterations=20,
+                alt_min_deg=3, alt_max_deg=88,
+                fix_az0=near_zenith, fit_distortion=True,
+                horizon_r=None, horizon_weight=0.0,
+            )
+            rescue_v3 = _bright_match_rate(r_d)
+            if verbose and rescue_v3 is not None:
+                log.info(f"Step 6r: rescue v<3={rescue_v3[2]:.0%} "
+                         f"(n={r_nd}, rms={r_rd:.2f}, f={r_d.f:.0f}, "
+                         f"k1={r_d.k1:.2e})")
+            if rescue_v3 is not None and rescue_v3[2] > main_v3[2]:
+                best_model = r_d
+                best_n = r_nd
+                best_rms = r_rd
+                diag["rescue_used"] = True
+                if verbose:
+                    log.info("Step 6r: rescue accepted")
+            else:
+                diag["rescue_used"] = False
+        except Exception as e:
+            diag["rescue_used"] = False
+            if verbose:
+                log.info(f"Step 6r: rescue failed: {e}")
 
     # --- Step 7: Residual diagnostics ---
     if verbose:
