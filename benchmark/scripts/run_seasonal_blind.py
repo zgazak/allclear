@@ -108,13 +108,29 @@ def solve_one_frame(args_tuple):
     ny, nx = data.shape
     max_rms = max(6.0, min(nx, ny) * 0.004)
     is_mirrored = diag.get("mirrored", False)
+    # Bright-anchor catalog match-rate gate (vmag<3): a correct solve
+    # matches 85%+ of in-frame vmag<3 stars on any all-sky camera, since
+    # vmag<3 stars are detectable even with modest sensitivity.  Wrong-
+    # basin solves score below 50% on this bin.  We require enough
+    # in-frame anchors for the fraction to be meaningful.
+    BRIGHT_MIN_FRAC = 0.70
+    BRIGHT_MIN_TOTAL = 20
+    bright = diag.get("catalog_match", {}).get("v3", {})
+    bright_frac = float(bright.get("frac", 1.0))
+    bright_n = int(bright.get("n", 0))
+    bright_total = int(bright.get("total", 0))
 
-    if n_matched < 30 or rms > max_rms:
+    if (n_matched < 30 or rms > max_rms
+            or (bright_total >= BRIGHT_MIN_TOTAL
+                and bright_frac < BRIGHT_MIN_FRAC)):
         reason = []
         if n_matched < 30:
             reason.append(f"n={n_matched}<30")
         if rms > max_rms:
             reason.append(f"rms={rms:.1f}>{max_rms:.1f}")
+        if (bright_total >= BRIGHT_MIN_TOTAL
+                and bright_frac < BRIGHT_MIN_FRAC):
+            reason.append(f"bright_match={bright_n}/{bright_total}={bright_frac:.0%}<{BRIGHT_MIN_FRAC:.0%}")
         status = f"failed: {', '.join(reason)}"
         print(f"  FAIL {fpath.name}: {status}", flush=True)
         return {

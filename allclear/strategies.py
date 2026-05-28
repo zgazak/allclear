@@ -2001,6 +2001,55 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
             yi_e = cy_est + r_edge * dy
             grad_points.append((float(xi_e), float(yi_e)))
 
+    # --- Method 4: Flat-field outside boundary ---
+    # Outside the visible sky disc, pixels are vignetted/dead and sit at
+    # `dark_level` with only sensor read-noise variation.  Build a tight
+    # mask of "outside-candidate" pixels (within a few sigma of dark),
+    # keep only the LARGEST connected component (which is the canonical
+    # outside annulus connected to the image corners), then per-ray scan
+    # from r_max inward and find the first pixel that is NOT in that
+    # outside region.  Distinct from envelope's "outermost above-half-
+    # threshold pixel" because the threshold here is anchored on the
+    # dark statistics, not the dark-sky halfway point.  Internal sky
+    # structure (Milky Way, zodiacal) is comfortably above dark+Nsigma
+    # so it doesn't confuse the boundary.
+    from scipy.ndimage import label as nd_label
+    if np.sum(dark_mask) > 100:
+        sigma_dark = float(np.std(img[dark_mask]))
+    else:
+        sigma_dark = float(np.std(img) * 0.1)
+    flat_threshold = dark_level + max(4.0 * sigma_dark, 8.0)
+    outside_candidate = img < flat_threshold
+    labeled, n_components = nd_label(outside_candidate)
+    if n_components > 0:
+        # Find the component that touches the most image corners (or
+        # simply the largest one).  Largest is robust enough.
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0  # background label 0 is "not outside"
+        outside_label = int(np.argmax(sizes))
+        outside_mask = (labeled == outside_label)
+    else:
+        outside_mask = outside_candidate
+
+    flat_points = []
+    for angle in angles:
+        dx, dy = np.cos(angle), np.sin(angle)
+        # Scan inward from r_max; find first not-outside pixel.
+        r_h = None
+        for r in np.arange(r_max - step, r_min, -step):
+            xi = int(round(cx_est + r * dx))
+            yi = int(round(cy_est + r * dy))
+            if xi < 1 or xi >= nx - 1 or yi < 1 or yi >= ny - 1:
+                continue
+            if not outside_mask[yi, xi]:
+                # transitioned from outside to inside at this radius
+                r_h = r
+                break
+        if r_h is None:
+            continue
+        flat_points.append((float(cx_est + r_h * dx),
+                            float(cy_est + r_h * dy)))
+
     # --- Method 3: Outer envelope (scan inward) ---
     # For each ray, find the outermost radius where smoothed brightness
     # is still above the sky/dark threshold.  Telescope domes and
@@ -2052,22 +2101,17 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
         yi_e = cy_est + r_edge * dy
         env_points.append((float(xi_e), float(yi_e)))
 
-    # Fit circles from all three methods with iterative outlier rejection.
-    # Buildings/structures intrude into the sky circle, pulling boundary
-    # points inward.  We iteratively fit, reject points far INSIDE the
-    # circle (these hit obstructions), and refit.  The envelope method
-    # is fit with an outward-biased one-sided rejection so its result
-    # hugs the outer perimeter of the bright disc.
-    results = []
-    for label, points, side in [
-        ("threshold", thresh_points, "symmetric"),
-        ("gradient", grad_points, "symmetric"),
-        ("envelope", env_points, "outward"),
-    ]:
-        if len(points) < 10:
-            continue
+    # Fit circles per method.  Envelope uses RANSAC: it tends to have
+    # localized outlier clusters (cloud bands extending past the true
+    # horizon, sodiacal/Milky Way structure on bright-sky frames) and
+    # least-squares with outward-biased rejection still gets pulled by
+    # them.  RANSAC finds the dominant circle from the unpolluted
+    # majority of per-ray picks and treats the bad cluster as outliers.
+    # Threshold and gradient retain the original iterative-rejection fit
+    # because their failure mode is interior (dome/building intrusions),
+    # which the inward-biased rejection already handles.
+    def _fit_iterative(points, side):
         bp = np.array(points)
-
         for _clip_iter in range(3):
             bx, by = bp[:, 0], bp[:, 1]
             A = np.column_stack([-2 * bx, -2 * by, np.ones(len(bx))])
@@ -2077,38 +2121,125 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
             cy_f = lstsq[0][1]
             c_val = lstsq[0][2]
             R_f = np.sqrt(max(0, cx_f**2 + cy_f**2 - c_val))
-
-            # Reject points that are far inside the fitted circle
-            # (buildings/obstructions).  Keep points near or outside.
             dists = np.sqrt((bx - cx_f)**2 + (by - cy_f)**2)
-            residuals = dists - R_f  # negative = inside circle
+            residuals = dists - R_f
             sigma = float(np.std(residuals))
             if side == "outward":
-                # Aggressive interior rejection (dome stragglers),
-                # modest exterior rejection (lights, image-edge noise).
                 keep = (residuals > -0.5 * sigma) & (residuals < 2.0 * sigma)
             else:
-                # Keep points within 1.5 sigma of the circle or outside it
                 keep = residuals > -1.5 * sigma
             if np.sum(keep) < 10:
                 break
             bp = bp[keep]
+        return cx_f, cy_f, R_f, len(bp)
 
-        # Reject fits where center is far from estimate
+    def _fit_circle_ransac(points, inlier_tol=30.0, n_iter=300, seed=0):
+        """RANSAC circle fit. Returns (cx, cy, R, n_inliers)."""
+        pts = np.asarray(points, dtype=np.float64)
+        if len(pts) < 3:
+            return None
+        rng = np.random.default_rng(seed)
+        best = None  # (n_inliers, cx, cy, R, inlier_mask)
+        n = len(pts)
+        for _ in range(n_iter):
+            idx = rng.choice(n, size=3, replace=False)
+            p1, p2, p3 = pts[idx]
+            # Exact circle through 3 points via perpendicular-bisector
+            # intersection.  Degenerate if collinear (denom ~ 0).
+            ax, ay = p1; bx, by = p2; cx_, cy_ = p3
+            d = 2.0 * (ax * (by - cy_) + bx * (cy_ - ay) + cx_ * (ay - by))
+            if abs(d) < 1e-9:
+                continue
+            ux = ((ax * ax + ay * ay) * (by - cy_)
+                  + (bx * bx + by * by) * (cy_ - ay)
+                  + (cx_ * cx_ + cy_ * cy_) * (ay - by)) / d
+            uy = ((ax * ax + ay * ay) * (cx_ - bx)
+                  + (bx * bx + by * by) * (ax - cx_)
+                  + (cx_ * cx_ + cy_ * cy_) * (bx - ax)) / d
+            R_try = float(np.hypot(ax - ux, ay - uy))
+            # Sanity bounds — reject crazy circles.
+            if R_try < r_min or R_try > r_max * 1.5:
+                continue
+            dists = np.sqrt((pts[:, 0] - ux) ** 2 + (pts[:, 1] - uy) ** 2)
+            inliers = np.abs(dists - R_try) < inlier_tol
+            n_in = int(inliers.sum())
+            if best is None or n_in > best[0]:
+                best = (n_in, ux, uy, R_try, inliers)
+        if best is None or best[0] < 10:
+            return None
+        # Refit least-squares on inliers for accurate center+R.
+        in_pts = pts[best[4]]
+        bx, by = in_pts[:, 0], in_pts[:, 1]
+        A = np.column_stack([-2 * bx, -2 * by, np.ones(len(bx))])
+        b_vec = -(bx ** 2 + by ** 2)
+        sol = np.linalg.lstsq(A, b_vec, rcond=None)[0]
+        cx_f, cy_f = float(sol[0]), float(sol[1])
+        R_f = float(np.sqrt(max(0.0, cx_f ** 2 + cy_f ** 2 - sol[2])))
+        return cx_f, cy_f, R_f, int(best[0])
+
+    results = []
+    for label, points, fitter in [
+        ("threshold", thresh_points, "iterative_sym"),
+        ("gradient", grad_points, "iterative_sym"),
+        ("envelope", env_points, "ransac"),
+        ("flatfield", flat_points, "ransac"),
+    ]:
+        if len(points) < 10:
+            continue
+        if fitter == "ransac":
+            r = _fit_circle_ransac(points)
+            if r is None:
+                continue
+            cx_f, cy_f, R_f, n_kept = r
+        else:
+            cx_f, cy_f, R_f, n_kept = _fit_iterative(points, "symmetric")
+
         if abs(cx_f - cx_est) > nx * 0.3 or abs(cy_f - cy_est) > ny * 0.3:
             continue
-        results.append((cx_f, cy_f, R_f, len(bp), label))
+        results.append((cx_f, cy_f, R_f, n_kept, label, len(points)))
 
     if not results:
         return cx_est, cy_est, min(cx_est, cy_est) * 0.8, 0
 
-    # Pick the result with the largest radius — the threshold method
-    # tends to fire early on internal features, while the gradient
-    # method finds the true sky edge.
-    best = max(results, key=lambda x: x[2])
-    log.info("  Horizon methods: %s",
-             ", ".join(f"{r[4]}=(R={r[2]:.0f}, n={r[3]})" for r in results))
-    return best[0], best[1], best[2], best[3]
+    # Arbitration: flat-field is the most principled outer-edge
+    # detector — its outside mask is anchored on dark statistics +
+    # largest-connected-component, so internal sky structure (Milky Way,
+    # zodiacal, scattered cloud) can't mislead it.  Trust it directly
+    # when it has decent confidence.  Below that, fall back to envelope
+    # (RANSAC, fooled less by cloud pollution than threshold/gradient).
+    # Below that, fall back to envelope-vs-threshold agreement, then
+    # to max-R among the remaining methods.
+    by_label = {lbl: (cx, cy, R, n, n_input)
+                for (cx, cy, R, n, lbl, n_input) in results}
+    flat = by_label.get('flatfield')
+    env = by_label.get('envelope')
+    thr = by_label.get('threshold')
+    grd = by_label.get('gradient')
+
+    FLAT_MIN_KEPT = 50    # minimum RANSAC inliers to trust flat-field
+    ENV_AGREE_TOL = 0.03  # 3% relative R agreement with threshold
+
+    if flat and flat[3] >= FLAT_MIN_KEPT:
+        best = ('flatfield',) + flat
+    elif env and thr and abs(env[2] - thr[2]) / thr[2] <= ENV_AGREE_TOL:
+        best = ('envelope',) + env
+    else:
+        fallback = [(lbl, *m) for lbl, m in (('threshold', thr),
+                                             ('gradient', grd)) if m is not None]
+        if fallback:
+            best = max(fallback, key=lambda x: x[3])
+        elif env:
+            best = ('envelope',) + env
+        elif flat:
+            best = ('flatfield',) + flat
+        else:
+            best = max(((lbl, *m) for lbl, m in by_label.items()),
+                       key=lambda x: x[3])
+    log.info("  Horizon methods: %s -> %s",
+             ", ".join(f"{lbl}=(R={m[2]:.0f}, kept={m[3]}/{m[4]})"
+                       for lbl, m in by_label.items()),
+             best[0])
+    return best[1], best[2], best[3], best[4]
 
 
 def _make_detection_score_map(det_table, image_shape, sigma=3.0):
@@ -3136,10 +3267,18 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                              "(f within 35%% of %.0f)",
                              len(consistent), n_pre, f_from_horizon)
 
-        # Pick candidate with best score.  Weight match count heavily —
-        # for an unrefined blind-solve model, RMS is always high; the
-        # match count is the reliable signal that the solution is correct.
-        pm_candidates.sort(key=lambda c: -c[1] * c[1] / (1.0 + c[2] * c[2]))
+        # Pick candidate by match count primarily, with RMS as tiebreaker
+        # within similar match counts.  Pattern-match's Phase-3 RMS is
+        # unreliable for ranking across different geometry basins: a
+        # wide-basin "right" seed (downstream refinement will tighten it)
+        # commonly has RMS=20-40 while a narrow degenerate "wrong" seed
+        # gets RMS=4-5.  Match count is the only signal that a candidate
+        # is in the true global basin.  Bucket by 10-match steps so a
+        # marginally higher n doesn't override a much-lower RMS at
+        # similar n.
+        def _pm_score(c):
+            return (-(c[1] // 10), c[2])
+        pm_candidates.sort(key=_pm_score)
         pm_model, pm_n, pm_rms, pm_diag, _ = pm_candidates[0]
 
         # If best candidate came from mirrored pass, flip the image
@@ -3978,6 +4117,52 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     diag["final_k1"] = best_model.k1
     diag["final_k2"] = best_model.k2
     diag["final_distortion_used"] = bool(flex_accepted)
+
+    # Catalog match-rate gate signal: per-vmag-bin fraction of in-frame
+    # catalog stars that have a detected point source within 8 px.
+    # Canonical solves match 85-100% of bright (vmag<3) stars regardless
+    # of camera sensitivity — the brightest stars are detectable by even
+    # the most modest all-sky cameras, so this is a camera-independent
+    # anchor.  Wrong-basin solves (mirror flip / f-k1 degeneracy / wrong
+    # rho) score below 50% at v<3.  Heavily cloudy frames also score low.
+    # Faint-end bins (v<5, v<6) characterize the camera's effective
+    # limiting magnitude — match-rate naturally falls off at the camera's
+    # detection limit and that's fine; the gate uses the bright anchor.
+    diag["catalog_match"] = {}
+    try:
+        for vmag_cut in (3.0, 4.0, 5.0, 6.0):
+            sel = ((vmag_ext < vmag_cut)
+                   & (cat_alt > np.radians(10))
+                   & (cat_alt < np.radians(85)))
+            s_az = cat_az[sel]
+            s_alt = cat_alt[sel]
+            s_matches = _guided_match(
+                image, best_model, s_az, s_alt,
+                search_radius=8,
+                min_peak=background + min_peak_offset,
+                background=background,
+            )
+            sx, sy = best_model.sky_to_pixel(s_az, s_alt)
+            s_in_frame = ((sx > 20) & (sx < nx - 20)
+                          & (sy > 20) & (sy < ny - 20))
+            n_if = int(np.sum(s_in_frame))
+            frac = (len(s_matches) / n_if) if n_if > 0 else 0.0
+            diag["catalog_match"][f"v{vmag_cut:.0f}"] = {
+                "n": int(len(s_matches)),
+                "total": int(n_if),
+                "frac": float(frac),
+            }
+        if verbose:
+            bits = []
+            for vmag_cut in (3.0, 4.0, 5.0, 6.0):
+                d = diag["catalog_match"][f"v{vmag_cut:.0f}"]
+                bits.append(f"v<{vmag_cut:.0f}: {d['n']}/{d['total']}={d['frac']:.0%}")
+            log.info("Catalog match-rate by vmag (alt 10-85°): "
+                     + ", ".join(bits))
+    except Exception as e:
+        diag["catalog_match"] = {"error": str(e)}
+        if verbose:
+            log.info(f"Catalog match-rate computation failed: {e}")
 
     if verbose:
         log.info(f"Final: {best_n} matches, RMS={best_rms:.2f}, "

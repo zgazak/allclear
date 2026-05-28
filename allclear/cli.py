@@ -346,6 +346,17 @@ def cmd_instrument_fit(args):
         # plate scales (larger images, shorter focal lengths) naturally
         # have higher pixel-domain residuals at the same angular accuracy.
         max_rms = max(6.0, min(nx, ny) * 0.004)
+        # Bright-anchor catalog match-rate (vmag<3) is a camera-independent
+        # quality signal: even modest all-sky cameras detect vmag<3 stars,
+        # so a correct solve in any system matches 85%+ of these.  Wrong-
+        # basin solves score <50% even when n_matched looks healthy.
+        BRIGHT_MIN_FRAC = 0.70
+        BRIGHT_MIN_TOTAL = 20
+        bright = diag.get("catalog_match", {}).get("v3", {})
+        bright_frac = float(bright.get("frac", 1.0))
+        bright_n = int(bright.get("n", 0))
+        bright_total = int(bright.get("total", 0))
+
         fail_reasons = []
         if n_matched < MIN_MATCHES:
             fail_reasons.append(
@@ -353,6 +364,12 @@ def cmd_instrument_fit(args):
         if rms > max_rms:
             fail_reasons.append(
                 f"RMS too high ({rms:.1f} > {max_rms:.1f} px)")
+        if (bright_total >= BRIGHT_MIN_TOTAL
+                and bright_frac < BRIGHT_MIN_FRAC):
+            fail_reasons.append(
+                f"bright-star match too low "
+                f"({bright_n}/{bright_total}={bright_frac:.0%} < "
+                f"{BRIGHT_MIN_FRAC:.0%})")
 
         if fail_reasons:
             print(f"  FAILED: {'; '.join(fail_reasons)}")
