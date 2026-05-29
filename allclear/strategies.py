@@ -4206,6 +4206,182 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     if flex_accepted:
         best_model = flex_model
 
+    # --- Step 8: Horizon nudge (joint k1, k2) ---
+    # Step 6's joint fit is driven by the bulk of mid-altitude matches,
+    # so f, k1, k2 are tuned to minimise the *average* radial residual.
+    # That can leave a wave residual: matches at θ~50° (alt~40°) sit
+    # tight, but the prediction drifts a few pixels inside or outside
+    # the actual star positions at θ~75° (alt~15°), and the visualised
+    # horizon ring at θ=π/2 sits off the disc edge by even more.
+    # A k1-only nudge corrects horizon but introduces a wave (k1·r²
+    # also moves mid-altitude predictions by ~12 % of the horizon
+    # correction, enough to displace previously-tight mid-alt stars).
+    # Solution: joint (dk1, dk2) LSQ over residuals across a wide
+    # altitude band — two free parameters can simultaneously flatten
+    # both the horizon residual (large r, k2 has 5th-order leverage)
+    # and the mid-altitude residual (smaller r, k1 dominates).  Across
+    # a clear blind-fit frame there are plenty of matches at all
+    # altitudes to drive a stable 2-parameter LSQ.
+    # Skippable via ALLCLEAR_SKIP_NUDGE=1.
+    import os as _os
+    _nudge_skipped = (_os.environ.get("ALLCLEAR_SKIP_NUDGE", "").strip()
+                      not in ("", "0"))
+    if _nudge_skipped:
+        diag["horizon_nudge_applied"] = False
+        if verbose:
+            log.info("Step 8: Horizon nudge SKIPPED (ALLCLEAR_SKIP_NUDGE set)")
+    if verbose and not _nudge_skipped:
+        log.info("Step 8: Horizon nudge")
+    try:
+        if _nudge_skipped:
+            raise StopIteration
+        # Match catalog stars over a wide altitude band (5–60°) so the
+        # LSQ has leverage on both the horizon term and the mid-altitude
+        # term.  First iteration uses a wide search window (25 px) to
+        # catch stars displaced 15+ px from prediction by the bulk fit;
+        # subsequent iterations tighten as the prediction converges.
+        nudge_mask = ((cat_alt > np.radians(5))
+                      & (cat_alt < np.radians(60))
+                      & (vmag_ext < 5.5))
+        n_az = cat_az[nudge_mask]
+        n_alt = cat_alt[nudge_mask]
+
+        diag["horizon_nudge_applied"] = False
+        diag["horizon_nudge_iters"] = []
+        nudge_total_dk1 = 0.0
+        nudge_total_dk2 = 0.0
+
+        for it in range(6):
+            # Search radius shrinks for the first three iters then stays
+            # tight; later iters just refine using whatever match set is
+            # stable.
+            sr = max(8, 25 - 6 * it)
+            n_matches = _guided_match(
+                image, best_model, n_az, n_alt,
+                search_radius=sr,
+                min_peak=background + min_peak_offset,
+                background=background,
+            )
+            if len(n_matches) < 30:
+                if verbose:
+                    log.info(f"  iter {it}: only {len(n_matches)} "
+                             f"matches at sr={sr}, stop")
+                break
+
+            cx_m, cy_m = best_model.cx, best_model.cy
+            f_m = best_model.f
+            cat_idx_arr = np.array([m[0] for m in n_matches])
+            det_x_arr = np.array([m[1] for m in n_matches])
+            det_y_arr = np.array([m[2] for m in n_matches])
+            mc_az = n_az[cat_idx_arr]
+            mc_alt = n_alt[cat_idx_arr]
+            pred_x, pred_y = best_model.sky_to_pixel(mc_az, mc_alt)
+            det_r = np.sqrt((det_x_arr - cx_m) ** 2
+                            + (det_y_arr - cy_m) ** 2)
+            pred_r = np.sqrt((pred_x - cx_m) ** 2 + (pred_y - cy_m) ** 2)
+            residuals = det_r - pred_r
+            theta = np.pi / 2 - mc_alt
+
+            # Joint (dk1, dk2) LSQ: residual at each match is
+            #   res_i = dk1·(f·θ_i)³ + dk2·(f·θ_i)⁵
+            # Solve  A x ≈ residuals  with x = [dk1, dk2].
+            r_i = f_m * theta
+            A = np.column_stack([r_i ** 3, r_i ** 5])
+            try:
+                x, *_ = np.linalg.lstsq(A, residuals, rcond=None)
+            except np.linalg.LinAlgError:
+                if verbose:
+                    log.info(f"  iter {it}: LSQ failed, stop")
+                break
+            dk1, dk2 = float(x[0]), float(x[1])
+
+            # Per-altitude residual summary for the log.
+            r_alt_lo = float(np.median(residuals[theta > np.radians(70)])
+                             ) if np.sum(theta > np.radians(70)) >= 5 else 0.0
+            r_alt_mid = float(np.median(residuals[(theta > np.radians(40))
+                                                  & (theta < np.radians(60))])
+                              ) if np.sum((theta > np.radians(40))
+                                          & (theta < np.radians(60))) >= 5 else 0.0
+            med_res = float(np.median(residuals))
+
+            if verbose:
+                log.info(f"  iter {it} (sr={sr}): n={len(residuals)}  "
+                         f"res low(θ>70°)={r_alt_lo:+.2f}px  "
+                         f"mid(40°<θ<60°)={r_alt_mid:+.2f}px  "
+                         f"→ dk1={dk1:+.2e}, dk2={dk2:+.2e}")
+
+            # Stop if overall residual already small.
+            if abs(med_res) <= 1.0 and abs(r_alt_lo) <= 2.0:
+                if verbose:
+                    log.info(f"  iter {it}: residual already small, stop")
+                break
+
+            # Sanity bounds: don't let a noisy LSQ push k1, k2 far.
+            k1_max = 0.3 / (f_m * f_m)
+            k2_max = 0.15 / (f_m ** 4)
+            new_k1 = best_model.k1 + dk1
+            new_k2 = best_model.k2 + dk2
+            if best_model.proj_type == ProjectionType.EQUIDISTANT:
+                new_k1 = min(new_k1, 0.0)
+            new_k1 = max(new_k1, -k1_max)
+            new_k2 = float(np.clip(new_k2, -k2_max, k2_max))
+            dk1_applied = new_k1 - best_model.k1
+            dk2_applied = new_k2 - best_model.k2
+            if dk1_applied == 0.0 and dk2_applied == 0.0:
+                if verbose:
+                    log.info(f"  iter {it}: bounds clamped both, stop")
+                break
+
+            nudged = CameraModel(
+                cx=cx_m, cy=cy_m,
+                az0=best_model.az0, alt0=best_model.alt0,
+                rho=best_model.rho, f=f_m,
+                proj_type=best_model.proj_type,
+                k1=new_k1, k2=new_k2,
+            )
+            v3_before = _bright_match_rate(best_model)
+            v3_after = _bright_match_rate(nudged)
+            bv = v3_before[2] if v3_before else 1.0
+            av = v3_after[2] if v3_after else 0.0
+            # Allow up to 5% v<3 drop — the joint nudge corrects a
+            # real radial-distortion residual.  The bulk Step 6 fit
+            # may have left v<3 a tiny bit better at the cost of
+            # mid-/low-altitude geometry; we deliberately spend a
+            # little of that here to fix the wave.
+            if av < bv - 0.05:
+                if verbose:
+                    log.info(f"  iter {it}: rejected (v<3 "
+                             f"{bv:.0%}→{av:.0%}, drop>5%), stop")
+                break
+
+            best_model = nudged
+            nudge_total_dk1 += dk1_applied
+            nudge_total_dk2 += dk2_applied
+            diag["horizon_nudge_applied"] = True
+            diag["horizon_nudge_iters"].append({
+                "iter": it, "dk1": dk1_applied, "dk2": dk2_applied,
+                "residual_low_px": r_alt_lo,
+                "residual_mid_px": r_alt_mid,
+                "n": len(residuals), "search_radius": sr,
+                "v3_before": bv, "v3_after": av,
+            })
+            if verbose:
+                log.info(f"  iter {it}: accepted  "
+                         f"k1 {best_model.k1 - dk1_applied:.2e}"
+                         f"→{best_model.k1:.2e}  "
+                         f"k2 {best_model.k2 - dk2_applied:.2e}"
+                         f"→{best_model.k2:.2e}  "
+                         f"v<3 {bv:.0%}→{av:.0%}")
+
+        diag["horizon_nudge_dk1"] = nudge_total_dk1
+        diag["horizon_nudge_dk2"] = nudge_total_dk2
+    except StopIteration:
+        pass  # ALLCLEAR_SKIP_NUDGE set
+    except Exception as e:
+        diag["horizon_nudge_applied"] = False
+        if verbose:
+            log.info(f"  Horizon nudge failed: {e}")
+
     diag["final_n_matched"] = best_n
     diag["final_rms"] = best_rms
     diag["final_f"] = best_model.f
