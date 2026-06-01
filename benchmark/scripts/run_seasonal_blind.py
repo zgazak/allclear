@@ -104,34 +104,29 @@ def solve_one_frame(args_tuple):
             "mirrored": False, "projection_type": "",
         }
 
-    # Quality gate
+    # Quality gate (3-state: pass / marginal / fail)
     ny, nx = data.shape
     max_rms = max(6.0, min(nx, ny) * 0.004)
     is_mirrored = diag.get("mirrored", False)
-    # Bright-anchor catalog match-rate gate (vmag<3): a correct solve
-    # matches 85%+ of in-frame vmag<3 stars on any all-sky camera, since
-    # vmag<3 stars are detectable even with modest sensitivity.  Wrong-
-    # basin solves score below 50% on this bin.  We require enough
-    # in-frame anchors for the fraction to be meaningful.
-    BRIGHT_MIN_FRAC = 0.70
-    BRIGHT_MIN_TOTAL = 20
-    bright = diag.get("catalog_match", {}).get("v3", {})
-    bright_frac = float(bright.get("frac", 1.0))
-    bright_n = int(bright.get("n", 0))
-    bright_total = int(bright.get("total", 0))
+    # The pipeline's instrument_fit_pipeline already computed an overall
+    # fit-quality state combining catalog match-rate (v<3 overall),
+    # n_matched, RMS, and the spatial "horizon-broken" check (low-alt
+    # band collapse while mid is healthy → likely wrong geometry).
+    pipeline_state = diag.get("fit_quality_state", "unknown")
+    pipeline_reason = diag.get("fit_quality_reason", "")
 
-    if (n_matched < 30 or rms > max_rms
-            or (bright_total >= BRIGHT_MIN_TOTAL
-                and bright_frac < BRIGHT_MIN_FRAC)):
-        reason = []
+    # Coarse RMS / count safety net in case the pipeline state is missing.
+    coarse_fail = (n_matched < 30 or rms > max_rms)
+
+    if pipeline_state == "fail" or coarse_fail:
+        reason_bits = []
         if n_matched < 30:
-            reason.append(f"n={n_matched}<30")
+            reason_bits.append(f"n={n_matched}<30")
         if rms > max_rms:
-            reason.append(f"rms={rms:.1f}>{max_rms:.1f}")
-        if (bright_total >= BRIGHT_MIN_TOTAL
-                and bright_frac < BRIGHT_MIN_FRAC):
-            reason.append(f"bright_match={bright_n}/{bright_total}={bright_frac:.0%}<{BRIGHT_MIN_FRAC:.0%}")
-        status = f"failed: {', '.join(reason)}"
+            reason_bits.append(f"rms={rms:.1f}>{max_rms:.1f}")
+        if pipeline_state == "fail":
+            reason_bits.append(pipeline_reason)
+        status = f"failed: {', '.join(reason_bits) or pipeline_reason}"
         print(f"  FAIL {fpath.name}: {status}", flush=True)
         return {
             "filename": fpath.name, "datetime": obs_dt, "status": status,
@@ -174,12 +169,25 @@ def solve_one_frame(args_tuple):
         except Exception as e:
             print(f"  WARN {fpath.name}: plot failed: {e}", flush=True)
 
-    print(f"  OK {fpath.name}: {n_matched} matches, RMS={rms:.2f}px"
-          f"{' (mirrored)' if is_mirrored else ''}", flush=True)
+    # Either PASS or MARGINAL.  Both save model + PNG, but MARGINAL is
+    # flagged so downstream "solve" doesn't promote it as a chained
+    # baseline (model fits this frame, but moon/clouds/laser-stars
+    # made the fit less reliable than a clean frame).
+    label = "MARGINAL" if pipeline_state == "marginal" else "OK"
+    status_str = "marginal" if pipeline_state == "marginal" else "ok"
+    extras = []
+    if pipeline_state == "marginal" and pipeline_reason:
+        extras.append(pipeline_reason)
+    if is_mirrored:
+        extras.append("mirrored")
+    extras_str = " (" + "; ".join(extras) + ")" if extras else ""
+    print(f"  {label} {fpath.name}: {n_matched} matches, "
+          f"RMS={rms:.2f}px{extras_str}", flush=True)
 
     return {
         "filename": fpath.name,
         "datetime": obs_dt,
+        "status": status_str,
         "f": model.f,
         "cx": model.cx,
         "cy": model.cy,
@@ -192,7 +200,6 @@ def solve_one_frame(args_tuple):
         "rms": rms,
         "mirrored": is_mirrored,
         "projection_type": model.proj_type.value,
-        "status": "ok",
     }
 
 
@@ -242,8 +249,9 @@ def plot_comparison(blind_csv, fixed_csv, output_dir):
                   "cy", "rho_deg", "status"]
     blind_raw = _read_csv_cols(blind_csv, blind_cols)
 
-    # Filter to successful
-    ok_mask = [s in ("ok", "cached") for s in blind_raw["status"]]
+    # Filter to "produced a model" (pass + marginal + cached).  Failed
+    # frames are excluded from the drift plot — they have no model to plot.
+    ok_mask = [s in ("ok", "marginal", "cached") for s in blind_raw["status"]]
     blind = {}
     for c in blind_cols:
         blind[c] = [v for v, m in zip(blind_raw[c], ok_mask) if m]
@@ -373,12 +381,23 @@ def main():
     write_csv(results, csv_path)
     print(f"\nCSV written: {csv_path}")
 
-    # Summary stats
-    ok = [r for r in results if r["status"] in ("ok", "cached")]
-    failed = [r for r in results if r["status"] not in ("ok", "cached")]
-    print(f"Succeeded: {len(ok)}/{len(results)}")
+    # Summary stats: pass / marginal / fail
+    n = len(results)
+    n_pass = sum(1 for r in results if r["status"] in ("ok", "cached"))
+    n_marg = sum(1 for r in results if r["status"] == "marginal")
+    n_fail = sum(1 for r in results if r["status"] not in ("ok", "cached",
+                                                            "marginal"))
+    failed = [r for r in results if r["status"] not in ("ok", "cached",
+                                                         "marginal")]
+    marginals = [r for r in results if r["status"] == "marginal"]
+    print(f"Clean PASS: {n_pass}/{n}   MARGINAL: {n_marg}/{n}   "
+          f"FAIL: {n_fail}/{n}")
+    if marginals:
+        print(f"Marginal (model usable but don't chain): {len(marginals)}")
+        for r in marginals[:10]:
+            print(f"  {r['filename']}")
     if failed:
-        print(f"Failed: {len(failed)}")
+        print(f"Failed (no model produced): {len(failed)}")
         for r in failed[:10]:
             print(f"  {r['filename']}: {r['status']}")
 
