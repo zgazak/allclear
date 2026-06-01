@@ -4432,10 +4432,106 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                 bits.append(f"v<{vmag_cut:.0f}: {d['n']}/{d['total']}={d['frac']:.0%}")
             log.info("Catalog match-rate by vmag (alt 10-85°): "
                      + ", ".join(bits))
+
+        # Per-altitude v<3 bands.  The overall v<3 fraction is a scalar
+        # signal; the SPATIAL signature is what distinguishes a genuine
+        # "model is correct just sparse" from "model is geometrically
+        # wrong at the horizon".  When zen+mid match well but low band
+        # collapses, the model is wrong at the rim even though enough
+        # stars match overall to look OK.
+        diag["catalog_match"]["v3_by_alt"] = {}
+        for lbl, alt_lo, alt_hi in [("zen", 60, 85),
+                                      ("mid", 30, 60),
+                                      ("low", 10, 30)]:
+            sel = ((vmag_ext < 3.0)
+                   & (cat_alt > np.radians(alt_lo))
+                   & (cat_alt < np.radians(alt_hi)))
+            ba_az = cat_az[sel]
+            ba_alt = cat_alt[sel]
+            ba_matches = _guided_match(
+                image, best_model, ba_az, ba_alt,
+                search_radius=8,
+                min_peak=background + min_peak_offset,
+                background=background,
+            )
+            bx, by = best_model.sky_to_pixel(ba_az, ba_alt)
+            b_in_frame = ((bx > 20) & (bx < nx - 20)
+                          & (by > 20) & (by < ny - 20))
+            n_if = int(np.sum(b_in_frame))
+            frac = (len(ba_matches) / n_if) if n_if > 0 else 0.0
+            diag["catalog_match"]["v3_by_alt"][lbl] = {
+                "n": int(len(ba_matches)),
+                "total": int(n_if),
+                "frac": float(frac),
+                "alt_range_deg": (alt_lo, alt_hi),
+            }
+        if verbose:
+            bits = []
+            for lbl in ("zen", "mid", "low"):
+                d = diag["catalog_match"]["v3_by_alt"][lbl]
+                bits.append(f"{lbl}: {d['n']}/{d['total']}={d['frac']:.0%}")
+            log.info("v<3 by altitude band: " + ", ".join(bits))
     except Exception as e:
         diag["catalog_match"] = {"error": str(e)}
         if verbose:
             log.info(f"Catalog match-rate computation failed: {e}")
+
+    # --- 3-state fit-quality gate ---
+    # PASS:     overall v<3 ≥ 80%, n_matched ≥ 500, low-alt band ≥ 50%
+    #           (or insufficient low-alt samples to evaluate).  Safe to
+    #           chain into "solve" mode as a baseline.
+    # MARGINAL: model is canonically-shaped and produces a usable fit,
+    #           but moon/clouds/laser-guide-stars suppress some bright
+    #           stars.  Don't promote to chained baseline; downstream
+    #           can use the fit for the same frame's transmission map
+    #           but should re-baseline from a cleaner frame.
+    # FAIL:     wrong basin, insufficient signal, or horizon clearly
+    #           broken (low-alt band collapsed while mid is healthy).
+    try:
+        v3 = diag["catalog_match"].get("v3", {})
+        v3_overall = v3.get("frac", 0.0)
+        v3_total = v3.get("total", 0)
+        low = diag["catalog_match"].get("v3_by_alt", {}).get("low", {})
+        mid = diag["catalog_match"].get("v3_by_alt", {}).get("mid", {})
+        low_total = low.get("total", 0)
+        low_frac = low.get("frac", 1.0)
+        mid_total = mid.get("total", 0)
+        mid_frac = mid.get("frac", 1.0)
+        # Horizon-broken: low band collapsed while mid is healthy.
+        # Need enough samples in each band to call it.
+        horizon_broken = (low_total >= 5 and mid_total >= 5
+                          and low_frac < 0.25 and mid_frac >= 0.60)
+
+        if horizon_broken:
+            state = "fail"
+            reason = (f"horizon-broken (low {low['n']}/{low_total}="
+                      f"{low_frac:.0%} vs mid {mid['n']}/{mid_total}="
+                      f"{mid_frac:.0%})")
+        elif v3_overall < 0.50 or (v3_total >= 20 and v3_overall < 0.50):
+            state = "fail"
+            reason = f"v<3={v3_overall:.0%}<50%"
+        elif (v3_overall >= 0.80 and best_n >= 500
+              and (low_total < 5 or low_frac >= 0.50)):
+            state = "pass"
+            reason = "clean"
+        else:
+            state = "marginal"
+            sig = []
+            if v3_overall < 0.80:
+                sig.append(f"v<3={v3_overall:.0%}<80%")
+            if best_n < 500:
+                sig.append(f"n={best_n}<500")
+            if low_total >= 5 and low_frac < 0.50:
+                sig.append(f"low={low['n']}/{low_total}={low_frac:.0%}<50%")
+            reason = "; ".join(sig) if sig else "unknown"
+
+        diag["fit_quality_state"] = state
+        diag["fit_quality_reason"] = reason
+        if verbose:
+            log.info(f"Fit quality: {state.upper()} ({reason})")
+    except Exception as e:
+        diag["fit_quality_state"] = "unknown"
+        diag["fit_quality_reason"] = f"error: {e}"
 
     if verbose:
         log.info(f"Final: {best_n} matches, RMS={best_rms:.2f}, "

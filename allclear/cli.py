@@ -342,37 +342,25 @@ def cmd_instrument_fit(args):
             meta=meta, progress=progress_cb,
         )
 
-        # Quality gate — scale RMS limit with image size since coarser
-        # plate scales (larger images, shorter focal lengths) naturally
-        # have higher pixel-domain residuals at the same angular accuracy.
+        # Quality gate — 3-state from instrument_fit_pipeline
         max_rms = max(6.0, min(nx, ny) * 0.004)
-        # Bright-anchor catalog match-rate (vmag<3) is a camera-independent
-        # quality signal: even modest all-sky cameras detect vmag<3 stars,
-        # so a correct solve in any system matches 85%+ of these.  Wrong-
-        # basin solves score <50% even when n_matched looks healthy.
-        BRIGHT_MIN_FRAC = 0.70
-        BRIGHT_MIN_TOTAL = 20
-        bright = diag.get("catalog_match", {}).get("v3", {})
-        bright_frac = float(bright.get("frac", 1.0))
-        bright_n = int(bright.get("n", 0))
-        bright_total = int(bright.get("total", 0))
+        pipeline_state = diag.get("fit_quality_state", "unknown")
+        pipeline_reason = diag.get("fit_quality_reason", "")
 
-        fail_reasons = []
+        # Coarse safety net (in case pipeline didn't return a state).
+        coarse_fail_reasons = []
         if n_matched < MIN_MATCHES:
-            fail_reasons.append(
+            coarse_fail_reasons.append(
                 f"too few matches ({n_matched} < {MIN_MATCHES})")
         if rms > max_rms:
-            fail_reasons.append(
+            coarse_fail_reasons.append(
                 f"RMS too high ({rms:.1f} > {max_rms:.1f} px)")
-        if (bright_total >= BRIGHT_MIN_TOTAL
-                and bright_frac < BRIGHT_MIN_FRAC):
-            fail_reasons.append(
-                f"bright-star match too low "
-                f"({bright_n}/{bright_total}={bright_frac:.0%} < "
-                f"{BRIGHT_MIN_FRAC:.0%})")
 
-        if fail_reasons:
-            print(f"  FAILED: {'; '.join(fail_reasons)}")
+        if pipeline_state == "fail" or coarse_fail_reasons:
+            bits = list(coarse_fail_reasons)
+            if pipeline_state == "fail":
+                bits.append(pipeline_reason)
+            print(f"  FAILED: {'; '.join(bits)}")
             if args.diagnostic_plot:
                 diag_path = _per_frame_diag_path(
                     args.diagnostic_plot, fits_path, len(frames))
@@ -390,8 +378,17 @@ def cmd_instrument_fit(args):
             fit_det, cat, fit_pairs, model, image=data,
         )
 
-        print(f"  OK: {n_matched} matches, RMS={rms:.2f}px, "
-              f"zeropoint={cal_zp:.3f}")
+        # PASS or MARGINAL — both produce a usable model; MARGINAL means
+        # downstream "solve" mode should not promote this as a chained
+        # baseline (use a cleaner frame to re-baseline).
+        if pipeline_state == "marginal":
+            print(f"  MARGINAL: {n_matched} matches, RMS={rms:.2f}px, "
+                  f"zeropoint={cal_zp:.3f}  ({pipeline_reason})")
+            print(f"    note: fit is usable for this frame but should NOT be "
+                  f"chained as a baseline for solve mode")
+        else:
+            print(f"  OK: {n_matched} matches, RMS={rms:.2f}px, "
+                  f"zeropoint={cal_zp:.3f}")
 
         results.append({
             "path": fits_path, "data": data, "meta": meta,
@@ -399,6 +396,7 @@ def cmd_instrument_fit(args):
             "n_matched": n_matched, "rms": rms, "diag": diag,
             "zeropoint": cal_zp, "fit_det": fit_det,
             "fit_pairs": fit_pairs, "nx": nx, "ny": ny,
+            "quality_state": pipeline_state,
         })
 
     # ---- No successful fits ----
