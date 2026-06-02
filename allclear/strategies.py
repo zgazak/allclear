@@ -2997,6 +2997,8 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     cat_az_deg = np.asarray(cat_table["az_deg"], dtype=np.float64)
     cat_alt_deg = np.asarray(cat_table["alt_deg"], dtype=np.float64)
     vmag_ext = np.asarray(cat_table["vmag_expected"], dtype=np.float64)
+    vmag_raw = (np.asarray(cat_table["vmag"], dtype=np.float64)
+                if "vmag" in cat_table.colnames else vmag_ext)
 
     cat_az = np.radians(cat_az_deg)
     cat_alt = np.radians(cat_alt_deg)
@@ -4237,12 +4239,16 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             raise StopIteration
         # Match catalog stars over a wide altitude band (5–60°) so the
         # LSQ has leverage on both the horizon term and the mid-altitude
-        # term.  First iteration uses a wide search window (25 px) to
-        # catch stars displaced 15+ px from prediction by the bulk fit;
-        # subsequent iterations tighten as the prediction converges.
+        # term.  Use RAW vmag (not extinction-corrected) for the cut:
+        # extinction adds 1.5-2 mag at horizon, so a vmag_ext<5.5 cut
+        # silently excludes the very low-altitude bright stars whose
+        # residual signals the horizon problem.  Raw-vmag cut keeps
+        # them in the candidate pool; guided_match's local-background
+        # threshold filters the actually-undetectable ones at search
+        # time.
         nudge_mask = ((cat_alt > np.radians(5))
                       & (cat_alt < np.radians(60))
-                      & (vmag_ext < 5.5))
+                      & (vmag_raw < 5.5))
         n_az = cat_az[nudge_mask]
         n_alt = cat_alt[nudge_mask]
 
@@ -4252,10 +4258,13 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
         nudge_total_dk2 = 0.0
 
         for it in range(6):
-            # Search radius shrinks for the first three iters then stays
-            # tight; later iters just refine using whatever match set is
-            # stable.
-            sr = max(8, 25 - 6 * it)
+            # First iter uses a wide search radius (75 px) so the LSQ
+            # can see low-altitude stars displaced 30+ px from prediction
+            # by an upstream horizon-fit bias.  Step 6's mid-altitude
+            # tight fit can leave the horizon off by that much without
+            # the bulk RMS noticing.  Subsequent iters tighten as the
+            # prediction converges.
+            sr = max(8, 75 - 14 * it)
             n_matches = _guided_match(
                 image, best_model, n_az, n_alt,
                 search_radius=sr,
@@ -4310,10 +4319,20 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
                          f"mid(40°<θ<60°)={r_alt_mid:+.2f}px  "
                          f"→ dk1={dk1:+.2e}, dk2={dk2:+.2e}")
 
-            # Stop if overall residual already small.
-            if abs(med_res) <= 1.0 and abs(r_alt_lo) <= 2.0:
+            # Stop when the LSQ proposal itself is negligible.  Using
+            # median residual as an exit signal is misleading on
+            # horizon-broken frames: the bulk of matches are at mid
+            # altitudes where the model is fine (residual ~0), and they
+            # dominate the median even when the few low-alt matches
+            # show a real residual.  The LSQ amplitude (dk1, dk2)
+            # weights by sensitivity so it doesn't get washed out.
+            f_h_cubed = (f_m * np.pi / 2) ** 3
+            f_h_fifth = (f_m * np.pi / 2) ** 5
+            horizon_shift = abs(dk1 * f_h_cubed + dk2 * f_h_fifth)
+            if horizon_shift < 1.0:
                 if verbose:
-                    log.info(f"  iter {it}: residual already small, stop")
+                    log.info(f"  iter {it}: predicted horizon shift "
+                             f"{horizon_shift:.2f}px < 1px, stop")
                 break
 
             # Sanity bounds: don't let a noisy LSQ push k1, k2 far.
