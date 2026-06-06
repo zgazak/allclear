@@ -151,6 +151,8 @@ def solve_one_frame(args_tuple):
         rms_residual_px=rms,
         fit_timestamp=obs_dt,
         frame_used=fpath.name,
+        quality_state="marginal" if pipeline_state == "marginal" else "pass",
+        quality_reason=pipeline_reason,
     )
     inst.save(str(model_path))
 

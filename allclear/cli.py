@@ -435,6 +435,9 @@ def cmd_instrument_fit(args):
         rms_residual_px=rms,
         fit_timestamp=datetime.now(timezone.utc).isoformat(),
         frame_used=best["path"].name,
+        quality_state=("marginal" if best["quality_state"] == "marginal"
+                       else "pass"),
+        quality_reason=best["diag"].get("fit_quality_reason", ""),
     )
     inst.photometric_zeropoint = best_zp
     pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)

@@ -62,6 +62,12 @@ class InstrumentModel:
     median_residual_px: float = 0.0
     fit_timestamp: str = ""
     frame_used: str = ""
+    # 3-state quality gate verdict ("pass" / "marginal" / "fail", "" =
+    # not evaluated).  marginal = model fits this frame but moon/cloud
+    # conditions made the fit less reliable — downstream consumers
+    # should not promote it as a chained baseline.
+    quality_state: str = ""
+    quality_reason: str = ""
 
     # --- Bookkeeping ---
     allclear_version: str = ""
@@ -164,6 +170,8 @@ class InstrumentModel:
                 "median_residual_px": self.median_residual_px,
                 "fit_timestamp": self.fit_timestamp,
                 "frame_used": self.frame_used,
+                "quality_state": self.quality_state,
+                "quality_reason": self.quality_reason,
             },
         }
         path.write_text(json.dumps(data, indent=2) + "\n")
@@ -211,6 +219,8 @@ class InstrumentModel:
             median_residual_px=fq.get("median_residual_px", 0.0),
             fit_timestamp=fq.get("fit_timestamp", ""),
             frame_used=fq.get("frame_used", ""),
+            quality_state=fq.get("quality_state", ""),
+            quality_reason=fq.get("quality_reason", ""),
         )
         sidecar = cls.obscuration_sidecar_path(path)
         if sidecar.exists():
