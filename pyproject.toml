@@ -39,6 +39,9 @@ dev = [
     "pytest-cov",
     "genbadge[coverage,tests]>=1.1.3",
 ]
+satellite = [
+    "sgp4>=2.25",
+]
 
 [project.scripts]
 allclear = "allclear.cli:main"
