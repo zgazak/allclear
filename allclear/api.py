@@ -36,10 +36,34 @@ True
 
 import pathlib
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 
+from .obscuration import ObscurationMask
 from .transmission import TransmissionMap
+
+
+# Per-direction status values returned by the dict-shaped query methods.
+# Order of checks at query time: STALE → BELOW_HORIZON → OBSCURED →
+# NO_DATA → CLEAR/CLOUDY.  OBSCURED means a persistent occlusion (dome,
+# tree, horizon terrain, dead column), distinct from CLOUDY which is a
+# transient transmission loss measured photometrically.  This split is
+# what makes the result actionable for link triage: cloud → "wait it
+# out", obscured → "you can never shoot there", clear-but-failed →
+# "look at the pointing chain".
+STATUS_STALE = "STALE"
+STATUS_BELOW_HORIZON = "BELOW_HORIZON"
+STATUS_OBSCURED = "OBSCURED"
+STATUS_NO_DATA = "NO_DATA"
+STATUS_CLEAR = "CLEAR"
+STATUS_CLOUDY = "CLOUDY"
+STATUS_SGP4_ERROR = "SGP4_ERROR"
+
+#: Minimum elevation considered "above horizon" for status queries.
+#: Matches the camera's horizon detection cutoff; downstream OGS code
+#: should apply its own (typically higher) elevation gate.
+HORIZON_ALT_DEG = 5.0
 
 
 @dataclass
@@ -73,6 +97,11 @@ class SkyTransmissionResult:
     per_star : list
         Per-star transmission data: list of dicts with az_deg, alt_deg,
         transmission for each measured star.
+    obscuration : ObscurationMask, optional
+        Persistent obscuration mask in sky coordinates (dome, trees,
+        horizon terrain, dead columns).  When present, the dict-shaped
+        query methods return status="OBSCURED" for directions falling in
+        an occluded sector instead of attributing the loss to cloud.
     """
 
     transmission_map: TransmissionMap
@@ -87,9 +116,52 @@ class SkyTransmissionResult:
     clear_fraction: float = 0.0
     frame_zeropoint: float = 0.0
     per_star: list = field(default_factory=list)
+    obscuration: Optional[ObscurationMask] = None
 
-    def query(self, az_deg, alt_deg):
-        """Look up transmission at an (az, alt) sky position.
+    # ------------------------------------------------------------------
+    # Staleness
+    # ------------------------------------------------------------------
+
+    def age_seconds(self, now=None):
+        """Seconds elapsed since ``self.obs_time``.
+
+        Parameters
+        ----------
+        now : astropy.time.Time, datetime, or ISO string, optional
+            Reference time.  Defaults to ``astropy.time.Time.now()`` (UTC).
+
+        Returns
+        -------
+        float
+            Age in seconds.  ``+inf`` if ``obs_time`` is unset.
+        """
+        from astropy.time import Time as AstroTime
+
+        if self.obs_time is None:
+            return float("inf")
+        obs = self.obs_time if isinstance(self.obs_time, AstroTime) \
+            else AstroTime(self.obs_time)
+        if now is None:
+            now = AstroTime.now()
+        elif not isinstance(now, AstroTime):
+            now = AstroTime(now)
+        return float((now - obs).to_value("s"))
+
+    def is_stale(self, max_age_seconds=300.0, now=None):
+        """True if ``age_seconds(now)`` exceeds ``max_age_seconds``."""
+        return self.age_seconds(now) > float(max_age_seconds)
+
+    # ------------------------------------------------------------------
+    # Point queries
+    # ------------------------------------------------------------------
+
+    def query(self, az_deg, alt_deg, max_age_seconds=None):
+        """Look up raw transmission at an (az, alt) sky position.
+
+        Low-level query: returns a single float, NaN if the position is
+        outside the grid (or if ``max_age_seconds`` is given and the
+        result is stale).  Use :meth:`query_azalt` for a dict that
+        carries status and the obscured-vs-cloudy distinction.
 
         Parameters
         ----------
@@ -97,19 +169,117 @@ class SkyTransmissionResult:
             Azimuth in degrees (0=N, 90=E).
         alt_deg : float
             Altitude in degrees (0=horizon, 90=zenith).
+        max_age_seconds : float, optional
+            If set and the result is older than this, return NaN instead
+            of the (potentially stale) cached transmission.
 
         Returns
         -------
         float
-            Transmission (0=opaque, 1=clear). NaN if outside coverage.
+            Transmission (0=opaque, 1=clear). NaN if outside coverage or
+            stale.
         """
+        if max_age_seconds is not None and self.is_stale(max_age_seconds):
+            return float("nan")
         return self.transmission_map.query(az_deg, alt_deg)
 
-    def query_radec(self, ra_deg, dec_deg, threshold=None):
+    def _classify(self, az_deg, alt_deg, *, threshold=None,
+                  max_age_seconds=None):
+        """Internal: classify a sky direction into a status dict.
+
+        Shared by :meth:`query_azalt`, :meth:`query_radec`, and the
+        satellite/pass-window queries so the status ladder stays
+        consistent across entry points.
+        """
+        thresh = threshold if threshold is not None else self.threshold
+
+        # 1. Staleness short-circuits everything else.
+        if max_age_seconds is not None and self.is_stale(max_age_seconds):
+            return {
+                "az_deg": round(float(az_deg) % 360.0, 2),
+                "alt_deg": round(float(alt_deg), 2),
+                "transmission": None,
+                "status": STATUS_STALE,
+                "age_seconds": round(self.age_seconds(), 1),
+            }
+
+        az = float(az_deg) % 360.0
+        alt = float(alt_deg)
+
+        # 2. Below the camera's horizon — no useful answer.
+        if alt < HORIZON_ALT_DEG:
+            return {
+                "az_deg": round(az, 2),
+                "alt_deg": round(alt, 2),
+                "transmission": None,
+                "status": STATUS_BELOW_HORIZON,
+            }
+
+        # 3. Persistent obscuration trumps any transmission value.
+        # The mask was excluded from probing during compute_transmission,
+        # but RBF interpolation can still produce a value here — that
+        # value would lie.  Authoritative answer: OBSCURED.
+        if self.obscuration is not None and not bool(
+                self.obscuration.is_visible(az, alt)):
+            return {
+                "az_deg": round(az, 2),
+                "alt_deg": round(alt, 2),
+                "transmission": None,
+                "status": STATUS_OBSCURED,
+            }
+
+        # 4. Measured transmission.
+        trans = self.transmission_map.query(az, alt)
+        if np.isnan(trans):
+            return {
+                "az_deg": round(az, 2),
+                "alt_deg": round(alt, 2),
+                "transmission": None,
+                "status": STATUS_NO_DATA,
+            }
+
+        return {
+            "az_deg": round(az, 2),
+            "alt_deg": round(alt, 2),
+            "transmission": round(float(trans), 3),
+            "status": STATUS_CLEAR if trans >= thresh else STATUS_CLOUDY,
+        }
+
+    def query_azalt(self, az_deg, alt_deg, *, threshold=None,
+                    max_age_seconds=None):
+        """Status query at a sky direction in horizontal coordinates.
+
+        Returns the same dict shape as :meth:`query_radec` — useful when
+        the caller already has (az, alt) from another source (e.g. a
+        mount encoder, an upstream ephemeris service, or a non-TLE
+        satellite tracker).
+
+        Parameters
+        ----------
+        az_deg, alt_deg : float
+            Azimuth and altitude in degrees.
+        threshold : float, optional
+            Override clear/cloudy threshold (default: use self.threshold).
+        max_age_seconds : float, optional
+            If set and the result is older than this, returns
+            status="STALE" instead of a transmission value.
+
+        Returns
+        -------
+        dict
+            Keys: az_deg, alt_deg, transmission, status.  status is one
+            of STALE, BELOW_HORIZON, OBSCURED, NO_DATA, CLEAR, CLOUDY.
+        """
+        return self._classify(az_deg, alt_deg, threshold=threshold,
+                              max_age_seconds=max_age_seconds)
+
+    def query_radec(self, ra_deg, dec_deg, threshold=None,
+                    max_age_seconds=None):
         """Look up transmission at a (RA, Dec) position.
 
         Converts equatorial coordinates to horizontal (az/alt) for the
-        observation time and site, then queries the transmission map.
+        result's ``obs_time`` and site, then runs the same status ladder
+        as :meth:`query_azalt`.
 
         Parameters
         ----------
@@ -119,54 +289,291 @@ class SkyTransmissionResult:
             Declination in degrees (J2000).
         threshold : float, optional
             Override clear/cloudy threshold (default: use self.threshold).
+        max_age_seconds : float, optional
+            If set and the result is older than this, returns
+            status="STALE" instead of a transmission value.
 
         Returns
         -------
         dict
-            Keys: az_deg, alt_deg, transmission, status.
-            status is one of: "CLEAR", "CLOUDY", "NO_DATA", "BELOW_HORIZON".
+            Keys: ra_deg, dec_deg, az_deg, alt_deg, transmission, status.
+            status is one of: STALE, BELOW_HORIZON, OBSCURED, NO_DATA,
+            CLEAR, CLOUDY.
         """
+        # Short-circuit on staleness before doing the coord transform.
+        if max_age_seconds is not None and self.is_stale(max_age_seconds):
+            return {
+                "ra_deg": round(float(ra_deg), 4),
+                "dec_deg": round(float(dec_deg), 4),
+                "az_deg": None,
+                "alt_deg": None,
+                "transmission": None,
+                "status": STATUS_STALE,
+                "age_seconds": round(self.age_seconds(), 1),
+            }
+
         from astropy.coordinates import SkyCoord, EarthLocation, AltAz
         import astropy.units as u
         import warnings
-
-        thresh = threshold if threshold is not None else self.threshold
 
         location = EarthLocation(
             lat=self.site_lat * u.deg,
             lon=self.site_lon * u.deg,
         )
         frame = AltAz(obstime=self.obs_time, location=location)
-        target = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
+        target = SkyCoord(ra=float(ra_deg) * u.deg,
+                          dec=float(dec_deg) * u.deg)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             altaz = target.transform_to(frame)
 
-        alt = float(altaz.alt.deg)
-        az = float(altaz.az.deg)
+        out = self._classify(
+            float(altaz.az.deg), float(altaz.alt.deg),
+            threshold=threshold,
+            max_age_seconds=None,  # already checked above
+        )
+        out["ra_deg"] = round(float(ra_deg), 4)
+        out["dec_deg"] = round(float(dec_deg), 4)
+        return out
 
-        if alt < 5:
+    # ------------------------------------------------------------------
+    # Satellite queries
+    # ------------------------------------------------------------------
+
+    def query_satellite(self, tle_line1, tle_line2, *, time=None,
+                        name=None, threshold=None, max_age_seconds=None):
+        """Query transmission at a satellite's current sky position.
+
+        Propagates the supplied TLE to ``time`` (default: the result's
+        ``obs_time``), converts the geocentric TEME position to
+        topocentric AltAz at the site, then runs the status ladder.
+
+        For OGS link triage this is the "was the sky clear at the
+        satellite's bearing?" question.  Pair with the satellite
+        terminal's pointing log to disambiguate weather outages from
+        targeting errors: status="CLEAR" + dropped link → look at the
+        pointing chain; status="CLOUDY"/"OBSCURED" → weather/structure,
+        not pointing.
+
+        Parameters
+        ----------
+        tle_line1, tle_line2 : str
+            The two TLE lines (each 69 characters, exactly as published).
+        time : str, datetime, or astropy.time.Time, optional
+            Epoch at which to evaluate the satellite position.  Default
+            is the result's ``obs_time`` (the frame's timestamp), which
+            is the only choice consistent with the cached transmission
+            map.  Passing a different ``time`` is allowed but means the
+            transmission lookup may be stale relative to the satellite
+            position — set ``max_age_seconds`` to enforce.
+        name : str, optional
+            Satellite name to echo in the result (purely for labelling).
+        threshold : float, optional
+            Override clear/cloudy threshold.
+        max_age_seconds : float, optional
+            If set and the result is older than this relative to
+            ``time``, returns status="STALE".
+
+        Returns
+        -------
+        dict
+            Keys: sat_name, time, az_deg, alt_deg, transmission, status.
+            status may also be "SGP4_ERROR" with ``error_code`` set if
+            the TLE propagation failed.
+
+        Raises
+        ------
+        ImportError
+            If the optional ``sgp4`` dependency is not installed.
+            Install with ``pip install allclear[satellite]`` or
+            ``pip install sgp4``.
+        """
+        try:
+            from sgp4.api import Satrec
+        except ImportError as e:
+            raise ImportError(
+                "Satellite queries require the 'sgp4' package. "
+                "Install with: pip install allclear[satellite]  "
+                "or: pip install sgp4"
+            ) from e
+
+        from astropy.coordinates import (
+            TEME, AltAz, EarthLocation, CartesianRepresentation,
+        )
+        from astropy.time import Time as AstroTime
+        import astropy.units as u
+
+        t = _coerce_time(time if time is not None else self.obs_time)
+
+        # Staleness measured relative to the queried time, not "now".
+        # If a future pass is being evaluated against a current map, the
+        # map is stale relative to the future epoch.
+        if max_age_seconds is not None and self.obs_time is not None:
+            obs = self.obs_time if isinstance(self.obs_time, AstroTime) \
+                else AstroTime(self.obs_time)
+            dt = abs(float((t - obs).to_value("s")))
+            if dt > float(max_age_seconds):
+                return {
+                    "sat_name": name,
+                    "time": t.isot,
+                    "az_deg": None,
+                    "alt_deg": None,
+                    "transmission": None,
+                    "status": STATUS_STALE,
+                    "age_seconds": round(dt, 1),
+                }
+
+        sat = Satrec.twoline2rv(tle_line1, tle_line2)
+        err, r_teme, _ = sat.sgp4(t.jd1, t.jd2)
+        if err != 0:
+            # sgp4 error codes: 1=mean eccentricity out of range,
+            # 2=mean motion out of range, 3=pert elements,
+            # 4=semi-latus rectum < 0, 5=epoch elements, 6=decayed.
             return {
-                "az_deg": round(az, 2),
-                "alt_deg": round(alt, 2),
-                "transmission": float("nan"),
-                "status": "BELOW_HORIZON",
+                "sat_name": name,
+                "time": t.isot,
+                "az_deg": None,
+                "alt_deg": None,
+                "transmission": None,
+                "status": STATUS_SGP4_ERROR,
+                "error_code": int(err),
             }
 
-        trans = self.transmission_map.query(az, alt)
+        location = EarthLocation(
+            lat=self.site_lat * u.deg,
+            lon=self.site_lon * u.deg,
+        )
+        teme = TEME(
+            CartesianRepresentation(
+                r_teme[0] * u.km, r_teme[1] * u.km, r_teme[2] * u.km,
+            ),
+            obstime=t,
+        )
+        altaz = teme.transform_to(AltAz(obstime=t, location=location))
 
-        if np.isnan(trans):
-            status = "NO_DATA"
-        elif trans >= thresh:
-            status = "CLEAR"
-        else:
-            status = "CLOUDY"
+        out = self._classify(
+            float(altaz.az.deg), float(altaz.alt.deg),
+            threshold=threshold,
+            max_age_seconds=None,  # already handled above
+        )
+        out["sat_name"] = name
+        out["time"] = t.isot
+        return out
+
+    def query_pass_window(self, tle_line1, tle_line2, *, start, end,
+                          step=10.0, name=None, threshold=None,
+                          max_age_seconds=None):
+        """Sample a satellite's status across a pass window.
+
+        Walks the satellite track from ``start`` to ``end`` at
+        ``step``-second cadence, classifying each sample, and returns
+        per-sample results plus summary stats useful for scheduling
+        ("will this pass have enough contiguous clear sky to close the
+        link?").
+
+        .. note::
+
+           The transmission map is frozen at ``obs_time``.  For passes
+           that occur well after the frame was taken, cloud motion makes
+           the map an increasingly poor predictor; use
+           ``max_age_seconds`` to flag stale samples explicitly rather
+           than silently relying on out-of-date data.
+
+        Parameters
+        ----------
+        tle_line1, tle_line2 : str
+            TLE lines for the satellite.
+        start, end : str, datetime, or astropy.time.Time
+            Window boundaries.
+        step : float
+            Sample cadence in seconds (default 10).
+        name : str, optional
+            Satellite name to echo in each sample.
+        threshold : float, optional
+            Override clear/cloudy threshold.
+        max_age_seconds : float, optional
+            Per-sample staleness gate (vs. the sample's epoch, not now).
+
+        Returns
+        -------
+        dict
+            Keys: n_samples, step_seconds, duration_seconds, n_clear,
+            n_cloudy, n_obscured, n_below_horizon, n_no_data, n_stale,
+            n_sgp4_error, clear_fraction (over samples above horizon),
+            longest_clear_window_seconds, max_alt_deg, samples (list of
+            per-sample dicts as returned by :meth:`query_satellite`).
+        """
+        from astropy.time import Time as AstroTime
+        import astropy.units as u
+
+        t_start = _coerce_time(start)
+        t_end = _coerce_time(end)
+        if (t_end - t_start).to_value("s") <= 0:
+            raise ValueError("end must be strictly after start")
+
+        step_s = float(step)
+        if step_s <= 0:
+            raise ValueError("step must be positive")
+
+        duration_s = float((t_end - t_start).to_value("s"))
+        # astropy Time arithmetic loses ~1e-13 relative precision, so an
+        # exact-multiple window (e.g. 120 s at 30 s step) reads back as
+        # 119.99999... and would drop the boundary sample.  Round up
+        # when within 1 ms of a step boundary.
+        n_samples = int(np.floor(duration_s / step_s + 1e-3 / step_s)) + 1
+        offsets_s = np.arange(n_samples) * step_s
+        times = [t_start + float(off) * u.s for off in offsets_s]
+
+        samples = [
+            self.query_satellite(
+                tle_line1, tle_line2,
+                time=t, name=name, threshold=threshold,
+                max_age_seconds=max_age_seconds,
+            )
+            for t in times
+        ]
+
+        statuses = [s["status"] for s in samples]
+        alts = [s["alt_deg"] for s in samples if s.get("alt_deg") is not None]
+
+        n_clear = statuses.count(STATUS_CLEAR)
+        n_cloudy = statuses.count(STATUS_CLOUDY)
+        n_obscured = statuses.count(STATUS_OBSCURED)
+        n_below = statuses.count(STATUS_BELOW_HORIZON)
+        n_no_data = statuses.count(STATUS_NO_DATA)
+        n_stale = statuses.count(STATUS_STALE)
+        n_err = statuses.count(STATUS_SGP4_ERROR)
+
+        # Longest contiguous CLEAR run, in seconds.
+        longest = current = 0
+        for st in statuses:
+            if st == STATUS_CLEAR:
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+
+        # Clear-fraction is computed over samples that are above the
+        # horizon — denominator is the realistic visibility window, not
+        # the whole user-specified time range.
+        n_above = n_samples - n_below
+        clear_fraction = (n_clear / n_above) if n_above > 0 else 0.0
 
         return {
-            "az_deg": round(az, 2),
-            "alt_deg": round(alt, 2),
-            "transmission": round(trans, 3) if not np.isnan(trans) else None,
-            "status": status,
+            "n_samples": n_samples,
+            "step_seconds": step_s,
+            "duration_seconds": round(duration_s, 1),
+            "n_clear": n_clear,
+            "n_cloudy": n_cloudy,
+            "n_obscured": n_obscured,
+            "n_below_horizon": n_below,
+            "n_no_data": n_no_data,
+            "n_stale": n_stale,
+            "n_sgp4_error": n_err,
+            "clear_fraction": round(clear_fraction, 3),
+            "longest_clear_window_seconds": round(longest * step_s, 1),
+            "max_alt_deg": round(max(alts), 2) if alts else None,
+            "samples": samples,
         }
 
     def to_dict(self):
@@ -174,7 +581,20 @@ class SkyTransmissionResult:
 
         Returns a summary suitable for JSON serialization, including the
         full gridded transmission map, metadata, and per-star data.
+        The obscuration mask is summarized (occluded fraction, frame
+        count) rather than serialized in full — the full mask lives in
+        the model's sidecar JSON.
         """
+        obs_summary = None
+        if self.obscuration is not None:
+            visible = (self.obscuration.weight >= 0.5)
+            obs_summary = {
+                "occluded_fraction": round(
+                    float(1.0 - np.nanmean(visible.astype(float))), 3),
+                "n_frames": int(self.obscuration.n_frames),
+                "az_bins": int(self.obscuration.weight.shape[1]),
+                "alt_bins": int(self.obscuration.weight.shape[0]),
+            }
         return {
             "obs_time": str(self.obs_time) if self.obs_time else None,
             "site_lat": self.site_lat,
@@ -188,7 +608,35 @@ class SkyTransmissionResult:
             "frame_zeropoint": round(self.frame_zeropoint, 4),
             "transmission_map": self.transmission_map.to_dict(),
             "per_star": self.per_star,
+            "obscuration": obs_summary,
         }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _coerce_time(t):
+    """Normalize an arbitrary time-like input to ``astropy.time.Time`` (UTC).
+
+    Accepts: ``astropy.time.Time`` (returned as-is), ``datetime``
+    (naive treated as UTC), or ISO-8601 string.
+    """
+    from astropy.time import Time as AstroTime
+    from datetime import datetime, timezone
+
+    if isinstance(t, AstroTime):
+        return t
+    if isinstance(t, str):
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return AstroTime(dt, scale="utc")
+    if isinstance(t, datetime):
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        return AstroTime(t, scale="utc")
+    return AstroTime(t)
 
 
 def get_sky_transmission(frame, model, *, time=None, threshold=0.7):
@@ -312,7 +760,10 @@ def get_sky_transmission(frame, model, *, time=None, threshold=0.7):
                         obscuration=inst.obscuration)
 
     if result.n_matched < 3:
-        # Not enough matches — return empty map with status
+        # Not enough matches — return empty map with status.  Still
+        # carry the obscuration mask through so callers can at least
+        # tell "this direction is permanently blocked" from "we don't
+        # know" when the solve fails.
         empty_map = interpolate_transmission(
             np.array([]), np.array([]), np.array([])
         )
@@ -327,6 +778,7 @@ def get_sky_transmission(frame, model, *, time=None, threshold=0.7):
             status=result.status or "low_matches",
             threshold=threshold,
             clear_fraction=0.0,
+            obscuration=inst.obscuration,
         )
 
     # Transmission
@@ -371,6 +823,7 @@ def get_sky_transmission(frame, model, *, time=None, threshold=0.7):
         clear_fraction=clear_frac,
         frame_zeropoint=zp,
         per_star=per_star,
+        obscuration=inst.obscuration,
     )
 
 
