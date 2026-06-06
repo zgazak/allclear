@@ -408,7 +408,7 @@ def main():
         if default_fixed.exists():
             fixed_csv = str(default_fixed)
 
-    if fixed_csv and Path(fixed_csv).exists() and len(ok) > 5:
+    if fixed_csv and Path(fixed_csv).exists() and (n_pass + n_marg) > 5:
         plot_comparison(csv_path, fixed_csv, output_dir)
 
     return 0
