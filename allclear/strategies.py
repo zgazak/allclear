@@ -2173,15 +2173,18 @@ def detect_horizon_circle(image, cx_est=None, cy_est=None,
                 best = (n_in, ux, uy, R_try, inliers)
         if best is None or best[0] < 10:
             return None
-        # Refit least-squares on inliers for accurate center+R.
+        # Refit on inliers with OUTWARD-biased rejection.  RANSAC's
+        # symmetric ±inlier_tol band admits obstruction-intruded points
+        # up to tol px INSIDE the circle, and a plain LSQ refit then
+        # lands several px low (domes/trees only intrude inward, never
+        # outward).  RANSAC handles the far outlier clusters; the
+        # outward-biased refit recovers the true outer envelope within
+        # the band.  (Dropping this bias cost ~8-13px of horizon R on
+        # liverpool/cloudynight, which the Step 6 horizon penalty then
+        # converted into a wrong k1/k2 split.)
         in_pts = pts[best[4]]
-        bx, by = in_pts[:, 0], in_pts[:, 1]
-        A = np.column_stack([-2 * bx, -2 * by, np.ones(len(bx))])
-        b_vec = -(bx ** 2 + by ** 2)
-        sol = np.linalg.lstsq(A, b_vec, rcond=None)[0]
-        cx_f, cy_f = float(sol[0]), float(sol[1])
-        R_f = float(np.sqrt(max(0.0, cx_f ** 2 + cy_f ** 2 - sol[2])))
-        return cx_f, cy_f, R_f, int(best[0])
+        cx_f, cy_f, R_f, _n_kept = _fit_iterative(in_pts, "outward")
+        return float(cx_f), float(cy_f), float(R_f), int(best[0])
 
     results = []
     for label, points, fitter in [
@@ -3498,8 +3501,14 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
     # and equisolid, which naturally map the horizon farther out.
     # The best alternative becomes the dist_seed for Step 6, where full
     # distortion fitting will determine the final quality.
+    # Trigger when |k1| is within the slight-pincushion allowance
+    # (not only exactly 0.0): a tiny k1 from Step 5a means the
+    # projection class is genuinely ambiguous, and the k1 <= 0 clamp
+    # for equidistant would otherwise block lenses that need positive
+    # k1 (e.g. stereographic-like Liverpool SkyCam).
     alt_proj_seed = None
-    if (hc_n >= 20 and dist_seed.k1 == 0.0 and
+    k1_ambiguous = abs(dist_seed.k1) <= 0.1 * 0.3 / (dist_seed.f ** 2)
+    if (hc_n >= 20 and k1_ambiguous and
             dist_seed.proj_type == ProjectionType.EQUIDISTANT):
         r_h_equi = _theta_to_r(np.pi / 2, dist_seed.f,
                                 ProjectionType.EQUIDISTANT)
@@ -3607,7 +3616,9 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             alt_min_deg=15, alt_max_deg=75,
             fix_az0=near_zenith,
             fit_distortion=fit_distortion,
-            horizon_r=hr, horizon_weight=2.0,
+            # weight=1.0: at 2.0 the horizon penalty steamrolled star
+            # residuals on short-f cameras (k1 -> 0, k2 compensating).
+            horizon_r=hr, horizon_weight=1.0,
         )
         if verbose:
             r_h = _apply_distortion(
@@ -3628,7 +3639,8 @@ def instrument_fit_pipeline(image, det_table, cat_table, initial_f=750.0,
             alt_min_deg=5, alt_max_deg=88,
             fix_az0=near_zenith,
             fit_distortion=fit_distortion,
-            horizon_r=hr, horizon_weight=2.0,
+            # weight=1.0: see Phase A comment.
+            horizon_r=hr, horizon_weight=1.0,
         )
         if verbose:
             r_h = _apply_distortion(
