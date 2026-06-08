@@ -190,23 +190,18 @@ def compute_transmission(det_table, cat_table, matched_pairs, camera_model,
     else:
         frame_zeropoint = 0.0
 
-    # Use the BEST (largest) of reference and per-frame zeropoints.
-    # Larger zeropoint = brighter stars = clearer sky.  If this frame
-    # measures a better zeropoint than the reference, the reference was
-    # calibrated under worse conditions — use the frame's value.
-    # Only upgrade when the per-frame measurement is reliable (enough
-    # matches and low scatter in the photometric offsets).
+    # Transmission must ALWAYS be measured against the model's clear-sky
+    # reference zeropoint when one is available.  The reference defines
+    # what "clear" means; normalizing to a per-frame zeropoint instead
+    # lets a cloudy frame redefine its own (degraded) sky as clear — a
+    # fully overcast frame whose only matches are bright Moon-region
+    # stars then renders all-green instead of all-red.  Stale-reference
+    # correction belongs at (re)calibration time, not silently here.
     if reference_zeropoint is not None and reference_zeropoint != 0.0:
         zeropoint = reference_zeropoint
         # Auto-correct old-convention negative zeropoints (pre-v0.3)
         if zeropoint < 0:
             zeropoint = -zeropoint
-        n_valid = int(np.sum(valid))
-        if n_valid >= 50:
-            offsets = cat_vmag[valid] - inst_mag[valid]
-            scatter = float(np.std(offsets))
-            if scatter < 1.0 and frame_zeropoint > zeropoint:
-                zeropoint = frame_zeropoint
     else:
         zeropoint = frame_zeropoint
 
