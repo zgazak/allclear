@@ -138,8 +138,12 @@ def measure_local_offsets(image, model, cat_az, cat_alt, cat_vmag,
     return offsets
 
 
-def fit_pointing_from_offsets(model, offsets, image_shape):
+def fit_pointing_from_offsets(model, offsets, image_shape, fix_center=False):
     """Fit a global pointing correction from local offset measurements.
+
+    fix_center: hold (cx, cy) fixed and absorb the measured offsets into
+    pointing (az0, alt0, rho) + focal length, instead of letting the
+    optical centre float per-frame (which misregisters near-zenith stars).
 
     Parameters
     ----------
@@ -182,11 +186,15 @@ def fit_pointing_from_offsets(model, offsets, image_shape):
     # But for small corrections, a simpler model: just apply (dcx, dcy)
     # and small angle adjustments.
 
-    # Start simple: apply median offset as center shift
+    # Start simple: apply median offset as center shift.  With
+    # fix_center, leave the centre alone — the offset is absorbed by the
+    # angular fit below (always run in that mode).
     ny, nx = image_shape
+    cshift_x = 0.0 if fix_center else med_dx
+    cshift_y = 0.0 if fix_center else med_dy
     corrected = CameraModel(
-        cx=model.cx + med_dx,
-        cy=model.cy + med_dy,
+        cx=model.cx + cshift_x,
+        cy=model.cy + cshift_y,
         az0=model.az0, alt0=model.alt0,
         rho=model.rho, f=model.f,
         proj_type=model.proj_type,
@@ -206,10 +214,13 @@ def fit_pointing_from_offsets(model, offsets, image_shape):
         "dy_spread": dy_spread,
     }
 
-    if dx_spread > 2.0 or dy_spread > 2.0:
+    if dx_spread > 2.0 or dy_spread > 2.0 or fix_center:
         # Offsets vary across the image → tilt/rotation correction needed.
-        # Fit (dcx, dcy, dalt0, drho, df) by computing how a model
-        # correction would shift predictions at each tile position.
+        # (With fix_center we always fit angles since the centre may not
+        # absorb even a uniform offset.)
+        # Default: fit (dcx, dcy, dalt0, drho, df).
+        # fix_center:  fit (daz0, dalt0, drho, df) with the centre fixed,
+        # freeing az0 so the boresight absorbs the offset.
         proj_type = model.proj_type
 
         # For each tile, pick a representative catalog star position
@@ -234,60 +245,71 @@ def fit_pointing_from_offsets(model, offsets, image_shape):
         # Original predictions at representative points
         orig_px, orig_py = model.sky_to_pixel(rep_az, rep_alt)
 
-        def residuals_tilt(params):
-            test = CameraModel(
-                cx=model.cx + params[0],
-                cy=model.cy + params[1],
-                az0=model.az0,
-                alt0=model.alt0 + params[2],
-                rho=model.rho + params[3],
-                f=model.f * (1 + params[4]),
-                proj_type=proj_type,
-                k1=model.k1, k2=model.k2,
+        def make_test(params):
+            if fix_center:
+                # params = (daz0, dalt0, drho, df); centre fixed
+                return CameraModel(
+                    cx=model.cx, cy=model.cy,
+                    az0=model.az0 + params[0],
+                    alt0=model.alt0 + params[1],
+                    rho=model.rho + params[2],
+                    f=model.f * (1 + params[3]),
+                    proj_type=proj_type, k1=model.k1, k2=model.k2,
+                )
+            return CameraModel(
+                cx=model.cx + params[0], cy=model.cy + params[1],
+                az0=model.az0, alt0=model.alt0 + params[2],
+                rho=model.rho + params[3], f=model.f * (1 + params[4]),
+                proj_type=proj_type, k1=model.k1, k2=model.k2,
             )
-            # Predicted pixel shift at each representative point
+
+        def residuals_tilt(params):
+            test = make_test(params)
             new_px, new_py = test.sky_to_pixel(rep_az, rep_alt)
             pred_dx = new_px - orig_px
             pred_dy = new_py - orig_py
-
             res = []
             for i, o in enumerate(offsets):
                 w = np.sqrt(o["n_matches"])
-                # Measured offset should match predicted offset
                 res.append(w * (pred_dx[i] - o["dx"]))
                 res.append(w * (pred_dy[i] - o["dy"]))
             return np.array(res)
 
-        p0 = [med_dx, med_dy, 0.0, 0.0, 0.0]
-        bounds_lo = [med_dx - 30, med_dy - 30,
-                     -np.radians(5), -np.radians(5), -0.02]
-        bounds_hi = [med_dx + 30, med_dy + 30,
-                     np.radians(5), np.radians(5), 0.02]
+        if fix_center:
+            # (daz0, dalt0, drho, df); az0 generous (polar singularity)
+            p0 = [0.0, 0.0, 0.0, 0.0]
+            bounds_lo = [-np.radians(45), -np.radians(5),
+                         -np.radians(45), -0.02]
+            bounds_hi = [np.radians(45), np.radians(5),
+                         np.radians(45), 0.02]
+        else:
+            p0 = [med_dx, med_dy, 0.0, 0.0, 0.0]
+            bounds_lo = [med_dx - 30, med_dy - 30,
+                         -np.radians(5), -np.radians(5), -0.02]
+            bounds_hi = [med_dx + 30, med_dy + 30,
+                         np.radians(5), np.radians(5), 0.02]
 
         result = least_squares(residuals_tilt, p0,
                                bounds=(bounds_lo, bounds_hi),
                                loss='soft_l1', f_scale=2.0)
         p = result.x
-
-        corrected = CameraModel(
-            cx=model.cx + p[0],
-            cy=model.cy + p[1],
-            az0=model.az0,
-            alt0=model.alt0 + p[2],
-            rho=model.rho + p[3],
-            f=model.f * (1 + p[4]),
-            proj_type=proj_type,
-            k1=model.k1, k2=model.k2,
-        )
-        summary["dcx"] = p[0]
-        summary["dcy"] = p[1]
-        summary["dalt0_deg"] = float(np.degrees(p[2]))
-        summary["drho_deg"] = float(np.degrees(p[3]))
-        summary["df_pct"] = p[4] * 100
-
-        log.info("Tilt correction: dcx=%.1f dcy=%.1f dalt0=%.2f° "
-                 "drho=%.2f° df=%.2f%%",
-                 p[0], p[1], np.degrees(p[2]), np.degrees(p[3]),
-                 p[4] * 100)
+        corrected = make_test(p)
+        if fix_center:
+            summary.update(dcx=0.0, dcy=0.0,
+                           daz0_deg=float(np.degrees(p[0])),
+                           dalt0_deg=float(np.degrees(p[1])),
+                           drho_deg=float(np.degrees(p[2])),
+                           df_pct=p[3] * 100)
+            log.info("Pointing (fixed centre): daz0=%.2f° dalt0=%.2f° "
+                     "drho=%.2f° df=%.2f%%", np.degrees(p[0]),
+                     np.degrees(p[1]), np.degrees(p[2]), p[3] * 100)
+        else:
+            summary.update(dcx=p[0], dcy=p[1],
+                           dalt0_deg=float(np.degrees(p[2])),
+                           drho_deg=float(np.degrees(p[3])),
+                           df_pct=p[4] * 100)
+            log.info("Tilt correction: dcx=%.1f dcy=%.1f dalt0=%.2f° "
+                     "drho=%.2f° df=%.2f%%", p[0], p[1], np.degrees(p[2]),
+                     np.degrees(p[3]), p[4] * 100)
 
     return corrected, summary
