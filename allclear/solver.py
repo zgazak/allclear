@@ -51,7 +51,7 @@ def _solve_quality(n_matched, rms):
 def fast_solve(image, det_table, cat_table, camera_model,
                match_radius=10.0, refine=True, guided=True,
                refit_rotation=False, fallback_model=None,
-               obscuration=None):
+               obscuration=None, fix_center=False):
     """Solve a frame using a known camera model.
 
     Uses guided matching (finding bright peaks at projected catalog
@@ -72,6 +72,13 @@ def fast_solve(image, det_table, cat_table, camera_model,
         Search radius in pixels for guided matching.
     refine : bool
         If True, refine small pointing offsets (Δaz, Δalt, Δρ, Δf).
+    fix_center : bool
+        If True, hold the optical centre (cx, cy) fixed during per-frame
+        refinement and free az0 instead (full boresight pointing).  The
+        centre is a fixed camera property; letting it float per-frame
+        misregisters small-radius near-zenith stars (false low
+        transmission at zenith).  Use for within-night sequences solved
+        against a stable reference model.
     guided : bool
         If True, use guided matching against pixel data (more robust).
     refit_rotation : bool
@@ -181,6 +188,7 @@ def fast_solve(image, det_table, cat_table, camera_model,
                         model, det_x_r[good], det_y_r[good],
                         cat_az_r[good], cat_alt_r[good],
                         wide=(iteration == 0),
+                        fix_center=fix_center,
                     )
 
             # Check: did rotation recovery actually improve things?
@@ -231,7 +239,7 @@ def fast_solve(image, det_table, cat_table, camera_model,
             if len(good) < 5:
                 break
             current, summary = fit_pointing_from_offsets(
-                current, good, image.shape)
+                current, good, image.shape, fix_center=fix_center)
 
         # Check: did the correction improve matches?
         corrected_matches = _guided_match(
@@ -259,7 +267,8 @@ def fast_solve(image, det_table, cat_table, camera_model,
         if np.sum(good) >= _MIN_MATCHES_REFINE:
             refined = _refine_pointing(
                 model, det_x_m[good], det_y_m[good],
-                cat_az_m[good], cat_alt_m[good])
+                cat_az_m[good], cat_alt_m[good],
+                fix_center=fix_center)
 
             # Check: did refine improve things?
             refined_matches = _guided_match(
@@ -310,13 +319,15 @@ def fast_solve(image, det_table, cat_table, camera_model,
             if np.sum(good) >= _MIN_MATCHES_REFINE:
                 model = _refine_pointing(
                     model, f_dx[good], f_dy[good],
-                    f_az[good], f_alt[good])
+                    f_az[good], f_alt[good],
+                    fix_center=fix_center)
 
         # Flood-fill for stars beyond initial match radius
         expanded, model = _flood_fill_match(
             image, model, bright_az, bright_alt,
             core_matches=filtered,
             min_peak=min_peak, background=background,
+            fix_center=fix_center,
         )
         matches = expanded
 
@@ -334,7 +345,7 @@ def fast_solve(image, det_table, cat_table, camera_model,
                 refit = _refine_pointing(
                     model, m_dx[good], m_dy[good],
                     m_az[good], m_alt[good],
-                    fit_distortion=True)
+                    fit_distortion=True, fix_center=fix_center)
                 # Re-match with refit model to check improvement
                 refit_matches = _guided_match(
                     image, refit, bright_az, bright_alt,
@@ -557,13 +568,20 @@ def _find_rotation_offset(image, model, cat_az, cat_alt, background,
 
 
 def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False,
-                     fit_distortion=False):
+                     fit_distortion=False, fix_center=False):
     """Refine pointing offsets, optionally including distortion.
 
-    Fits (cx, cy, alt0, combined_rotation, f) with az0 fixed to break
-    the near-zenith az0/rho degeneracy.  The combined rotation
-    (az0 + rho) is what matters physically; splitting between az0 and
-    rho is arbitrary for near-zenith cameras.
+    Default: fits (cx, cy, alt0, rho, f) with az0 fixed to break the
+    near-zenith az0/rho degeneracy.
+
+    fix_center=True: holds the optical centre (cx, cy) fixed and frees
+    az0 instead, fitting (az0, alt0, rho, f).  The centre is a fixed
+    camera property; with az0 also fixed the perpendicular component of
+    a pointing drift can only be absorbed by a spurious centre shift,
+    which misregisters small-radius near-zenith stars.  Freeing az0
+    gives the boresight its full 2-D pointing freedom (az0 = direction
+    of tilt, alt0 = magnitude) so the centre can stay put.  Near zenith
+    az0/rho become a degenerate flat valley, harmless to the projection.
 
     Parameters
     ----------
@@ -572,8 +590,16 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False,
     fit_distortion : bool
         If True, also fit k1 (radial distortion). Requires many matches
         to be well-constrained — use only on clear frames.
+    fix_center : bool
+        If True, hold (cx, cy) fixed and free az0 (see above).
     """
     proj_type = model.proj_type
+
+    if fix_center:
+        return _refine_pointing_fixed_center(
+            model, det_x, det_y, cat_az, cat_alt, wide=wide,
+            fit_distortion=fit_distortion)
+
     fixed_az0 = model.az0
 
     # Parameterize as (cx, cy, alt0, rho, f [, k1])
@@ -640,6 +666,57 @@ def _refine_pointing(model, det_x, det_y, cat_az, cat_alt, wide=False,
         alt0=params[2], rho=params[3], f=params[4],
         proj_type=proj_type,
         k1=k1_out, k2=model.k2,
+    )
+
+
+def _refine_pointing_fixed_center(model, det_x, det_y, cat_az, cat_alt,
+                                  wide=False, fit_distortion=False):
+    """Refine pointing with the optical centre held fixed and az0 free.
+
+    Parameterized as (az0, alt0, rho, f [, k1]); cx, cy are constants.
+    See _refine_pointing for the rationale.
+    """
+    proj_type = model.proj_type
+    cx, cy = model.cx, model.cy
+
+    # az0 needs generous range: near zenith a small tangential shift of
+    # the boresight can require a large az0 change (polar singularity).
+    az_lim = np.radians(45)
+    a_lim = np.radians(10 if wide else 5)
+    f_lo, f_hi = (0.95, 1.05) if wide else (0.99, 1.01)
+
+    # p = (az0, alt0, rho, f [, k1])
+    p0 = [model.az0, model.alt0, model.rho, model.f]
+    bounds_lo = [model.az0 - az_lim, model.alt0 - a_lim,
+                 model.rho - az_lim, model.f * f_lo]
+    bounds_hi = [model.az0 + az_lim, model.alt0 + a_lim,
+                 model.rho + az_lim, model.f * f_hi]
+    if fit_distortion:
+        p0.append(model.k1)
+        k1_max = 0.3 / model.f ** 2
+        bounds_lo.append(-k1_max)
+        bounds_hi.append(k1_max * 0.1)
+    p0 = np.array(p0)
+
+    def residuals(params):
+        k1 = params[4] if fit_distortion else model.k1
+        m = CameraModel(
+            cx=cx, cy=cy, az0=params[0], alt0=params[1],
+            rho=params[2], f=params[3], proj_type=proj_type,
+            k1=k1, k2=model.k2,
+        )
+        px, py = m.sky_to_pixel(cat_az, cat_alt)
+        return np.concatenate([px - det_x, py - det_y])
+
+    result = least_squares(
+        residuals, p0, bounds=(bounds_lo, bounds_hi),
+        loss="soft_l1", f_scale=3.0, max_nfev=500,
+    )
+    p = result.x
+    k1_out = p[4] if fit_distortion else model.k1
+    return CameraModel(
+        cx=cx, cy=cy, az0=p[0], alt0=p[1], rho=p[2], f=p[3],
+        proj_type=proj_type, k1=k1_out, k2=model.k2,
     )
 
 
@@ -834,7 +911,7 @@ def _recover_consistent_matches(verified, killed, model, cat_az, cat_alt,
 def _flood_fill_match(image, model, cat_az, cat_alt, core_matches,
                       min_peak, background,
                       max_rings=5, neighbor_dist_px=100.0,
-                      max_rms_factor=3.0):
+                      max_rms_factor=3.0, fix_center=False):
     """Grow matched region outward from a verified core.
 
     Starting from reliable core matches, iteratively try to match
@@ -1012,7 +1089,7 @@ def _flood_fill_match(image, model, cat_az, cat_alt, core_matches,
             if np.sum(clip) >= _MIN_MATCHES_REFINE:
                 refined = _refine_pointing(
                     model, d_x[clip], d_y[clip],
-                    c_az[clip], c_alt[clip])
+                    c_az[clip], c_alt[clip], fix_center=fix_center)
                 ref_rms = _rms(matched, refined)
                 if ref_rms <= current_rms * 1.1:
                     model = refined
