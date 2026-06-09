@@ -11,10 +11,15 @@ from pathlib import Path
 
 ROOT = Path("/stars/src/allclear")
 DATA = ROOT / "benchmark/data/apicam_drift_nightly"
-MODEL = ROOT / "benchmark/results/apicam_nightly/model.json"
+# Reference = best model from BEFORE this night (2019-02-24 seasonal
+# blind solve) with the clear-sky zeropoint carried over.  Solved with
+# fix_center=True so the optical centre stays pinned and per-frame
+# pointing drift is absorbed by az0/alt0/rho (kills the zenith sawtooth).
+MODEL = ROOT / "benchmark/results/apicam_nightly/model_prenight.json"
 OUTCSV = ROOT / "benchmark/results/apicam_nightly/clearfrac_night.csv"
 THRESHOLD = 0.7
 ALT_MIN = 30.0
+FIX_CENTER = True
 
 
 def one(fpath):
@@ -36,7 +41,8 @@ def one(fpath):
             det["x"] = (data.shape[1] - 1) - np.asarray(det["x"],
                                                         dtype=np.float64)
         result = fast_solve(data, det, cat, camera, guided=True,
-                            refine=True, obscuration=inst.obscuration)
+                            refine=True, obscuration=inst.obscuration,
+                            fix_center=FIX_CENTER)
         use_det = (result.guided_det_table
                    if result.guided_det_table is not None
                    and len(result.guided_det_table) > 0 else det)
