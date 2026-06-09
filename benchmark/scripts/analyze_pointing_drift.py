@@ -174,7 +174,8 @@ def load_and_solve_frame(fpath, inst, camera_ref, save_images_dir=None,
 
     result = fast_solve(data, det, cat, camera_ref, guided=True,
                         refit_rotation=False,
-                        fallback_model=fallback_model)
+                        fallback_model=fallback_model,
+                        fix_center=True)
 
     if result.n_matched < 5:
         log.warning("LOW MATCHES %s: %d matches", fpath.name, result.n_matched)
