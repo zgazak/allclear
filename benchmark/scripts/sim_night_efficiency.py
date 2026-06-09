@@ -52,7 +52,7 @@ BYTES_PER_FRAME = FRAME_PX * FRAME_PX * (BIT_DEPTH // 8)
 GB_PER_FRAME = BYTES_PER_FRAME / 1e9              # decimal GB
 GB_PER_TARGET = GB_PER_FRAME * FRAMES_PER_TARGET
 FULL_RATE_GBH = GB_PER_TARGET / CYCLE_S * 3600.0  # GB/h if observing every cycle
-BIN_MIN = 15.0                                    # rate-plot time bin
+SMOOTH_MIN = 6.0                                  # rate-plot Gaussian smoothing (min)
 
 
 def load(csv_path):
@@ -83,8 +83,18 @@ def main():
         / "results/apicam_nightly/clearfrac_night.csv")
     out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else csv_path.parent
 
+    from scipy.ndimage import gaussian_filter1d
     mjd, cf30, has30, rows = load(csv_path)
     hrs, p_clear, sky_clear, night_s, n_cycles = build_cycles(mjd, cf30, has30)
+
+    # Time smoothing (the raw per-frame clear fraction carries the ~2-3 min
+    # derotation wiggle; smooth it for the trend curves).
+    sigma = SMOOTH_MIN / (CYCLE_S / 60.0)
+
+    def sm(v):
+        return gaussian_filter1d(v.astype(float), sigma, mode="nearest")
+
+    transp_pct = sm(100.0 * p_clear)
 
     # Expected-value volumes per cycle
     blind_good = GB_PER_TARGET * p_clear           # clear frames written blind
@@ -119,76 +129,94 @@ def main():
     print(f"  AllClear idle (overcast) = {int(np.sum(~sky_clear))}/{n_cycles} "
           f"cycles ({100*np.mean(~sky_clear):.1f}%)")
 
-    # ---------- Figure 1: cumulative good/bad buildup ----------
+    # ---------- Figure 1: cumulative good/bad buildup, stacked, 2 panels ----------
     cb_good = np.cumsum(blind_good)
     cb_bad = np.cumsum(blind_bad)
+    cb_tot = cb_good + cb_bad            # = total written, blind
     ca_good = np.cumsum(ac_good)
-    fig, ax = plt.subplots(figsize=(11, 6.5))
-    # AllClear: all good, zero bad
-    ax.fill_between(hrs, 0, ca_good, color="#27ae60", alpha=0.18)
-    ax.plot(hrs, ca_good, color="#27ae60", lw=2.8,
-            label=f"AllClear — good/clear ({ac_useful:.0f} GB)")
-    ax.plot(hrs, np.zeros_like(hrs), color="#27ae60", lw=1.4, ls=":",
-            label="AllClear — bad/cloudy  ≡ 0 GB")
-    # Blind: good and bad both accumulate
-    ax.plot(hrs, cb_good, color="#16a085", lw=2.2, ls="--",
-            label=f"Blind — good/clear ({blind_useful:.0f} GB)")
-    ax.plot(hrs, cb_bad, color="#c0392b", lw=2.2, ls="--",
-            label=f"Blind — bad/cloudy ({blind_vol-blind_useful:.0f} GB)")
-    ax.plot(hrs, np.cumsum(np.full(n_cycles, GB_PER_TARGET)), color="#888",
-            lw=1.4, label=f"Blind — total written ({blind_vol:.0f} GB)")
-    ax.set_xlabel("Hours into night (UT from first frame)")
-    ax.set_ylabel("Cumulative data volume (GB)")
-    ax.set_ylim(bottom=0)
-    ax.set_title("Cumulative good/bad data buildup: AllClear vs blind "
-                 "pointing\n"
-                 f"{FRAME_PX}x{FRAME_PX} 16-bit, 6x1 s/target, "
-                 f"{CYCLE_S:.0f} s cadence")
-    ax.legend(loc="upper left")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
+    GREEN, RED = "#27ae60", "#c0392b"
+    fig, (axb, axa) = plt.subplots(2, 1, sharex=True, sharey=True,
+                                   figsize=(11, 9))
+
+    # Blind panel: good (bottom) + bad (stacked on top) = total written.
+    axb.fill_between(hrs, 0, cb_good, color=GREEN, alpha=0.55,
+                     label=f"good / clear  ({blind_useful:.0f} GB)")
+    axb.fill_between(hrs, cb_good, cb_tot, color=RED, alpha=0.55,
+                     label=f"bad / cloudy  ({blind_vol-blind_useful:.0f} GB)")
+    axb.plot(hrs, cb_tot, color="#444", lw=1.4,
+             label=f"total written  ({blind_vol:.0f} GB)")
+    axb.set_title(f"Blind random pointing — {100*blind_useful/blind_vol:.0f}% "
+                  f"of written data is usable")
+    axb.set_ylabel("Cumulative volume (GB)")
+    axb.legend(loc="upper left", framealpha=0.9)
+    axb.grid(alpha=0.3)
+
+    # AllClear panel: all good, zero bad.  Reference line = what blind wrote.
+    axa.fill_between(hrs, 0, ca_good, color=GREEN, alpha=0.55,
+                     label=f"good / clear  ({ac_useful:.0f} GB)")
+    axa.plot(hrs, ca_good, color=GREEN, lw=2.2)
+    axa.plot(hrs, cb_tot, color="#444", lw=1.2, ls="--",
+             label=f"(blind total, for reference: {blind_vol:.0f} GB)")
+    axa.fill_between(hrs, ca_good, cb_tot, color="#bbb", alpha=0.25,
+                     label="declined / idle (no cloudy data written)")
+    axa.set_title(f"AllClear target selection — 100% usable, "
+                  f"{ac_useful/blind_useful:.2f}x the science of blind")
+    axa.set_xlabel("Hours into night (UT from first frame)")
+    axa.set_ylabel("Cumulative volume (GB)")
+    axa.grid(alpha=0.3)
+    axa.set_ylim(bottom=0)
+    # Observable-sky transparency that AllClear is reacting to (twin axis).
+    axa_t = axa.twinx()
+    axa_t.plot(hrs, transp_pct, color="#2c3e50", lw=1.8, alpha=0.8,
+               label="% observable sky (>30°)")
+    axa_t.set_ylabel("% sky clear above 30°", color="#2c3e50")
+    axa_t.set_ylim(0, 100)
+    axa_t.tick_params(axis="y", labelcolor="#2c3e50")
+    h1, lab1 = axa.get_legend_handles_labels()
+    h2, lab2 = axa_t.get_legend_handles_labels()
+    axa.legend(h1 + h2, lab1 + lab2, loc="upper left", framealpha=0.9,
+               fontsize=9)
+
+    fig.suptitle("Cumulative good/bad data buildup: AllClear vs blind "
+                 f"pointing\n{FRAME_PX}x{FRAME_PX} 16-bit, 6x1 s/target, "
+                 f"{CYCLE_S:.0f} s cadence", y=0.99)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(out_dir / "night_efficiency.png", dpi=130)
 
     # ---------- Figure 2: good/bad collection RATE + transparency ----------
-    bin_h = BIN_MIN / 60.0
-    nb = int(np.ceil(hrs.max() / bin_h))
-    bidx = np.clip((hrs / bin_h).astype(int), 0, nb - 1)
-    bin_centers = (np.arange(nb) + 0.5) * bin_h
-
-    def binrate(vals):
-        out = np.zeros(nb)
-        for b in range(nb):
-            sel = bidx == b
-            if np.any(sel):
-                out[b] = vals[sel].sum() / bin_h     # GB per hour
-        return out
-
-    bg, bb = binrate(blind_good), binrate(blind_bad)
-    ag, ab = binrate(ac_good), binrate(ac_bad)
-    transp = np.array([100*p_clear[bidx == b].mean() if np.any(bidx == b)
-                       else np.nan for b in range(nb)])
+    # Instantaneous rates at cycle resolution, Gaussian-smoothed over time
+    # (raw per-frame clear fraction carries the ~2-3 min derotation wiggle;
+    # a smooth trend is what the figure conveys).
+    bg = sm(FULL_RATE_GBH * p_clear)             # blind good GB/h
+    bb = sm(FULL_RATE_GBH * (1.0 - p_clear))     # blind bad  GB/h
+    ag = sm(FULL_RATE_GBH * sky_clear.astype(float))   # AllClear good GB/h
+    transp = transp_pct
 
     fig, ax = plt.subplots(figsize=(12, 6.5))
-    ax.plot(bin_centers, ag, color="#27ae60", lw=2.6,
-            label="AllClear — good (clear) GB/h")
-    ax.plot(bin_centers, ab, color="#27ae60", lw=1.6, ls=":",
-            label="AllClear — bad (cloudy) GB/h  ≡ 0")
-    ax.plot(bin_centers, bg, color="#16a085", lw=2.0, ls="--",
-            label="Blind — good (clear) GB/h")
-    ax.plot(bin_centers, bb, color="#c0392b", lw=2.0, ls="--",
-            label="Blind — bad (cloudy) GB/h")
     ax.axhline(FULL_RATE_GBH, color="#888", lw=1, ls=":",
                label=f"full observing rate ({FULL_RATE_GBH:.0f} GB/h)")
+    ax.plot(hrs, ag, color="#27ae60", lw=2.8,
+            label="AllClear — good (clear) GB/h")
+    ax.plot(hrs, np.zeros_like(hrs), color="#27ae60", lw=1.6, ls=":",
+            label="AllClear — bad (cloudy) GB/h  ≡ 0")
+    ax.plot(hrs, bg, color="#16a085", lw=2.0, ls="--",
+            label="Blind — good (clear) GB/h")
+    ax.plot(hrs, bb, color="#c0392b", lw=2.0, ls="--",
+            label="Blind — bad (cloudy) GB/h")
     ax.set_xlabel("Hours into night (UT from first frame)")
     ax.set_ylabel("Data collection rate (GB / h)")
-    ax.set_ylim(bottom=0)
+    # Float the floor slightly below zero so AllClear's bad ≡ 0 line is
+    # visibly separated from the axis (tick at 0 still anchors the scale).
+    ax.set_ylim(-2.0, FULL_RATE_GBH * 1.08)
+    ax.set_yticks([0, 20, 40, 60, 80])
     ax.set_title("Good vs bad data collection rate — AllClear vs blind\n"
-                 f"{BIN_MIN:.0f}-min bins; '%clear sky' = transparency above "
-                 f"{ALT_MIN_NOTE:.0f}° (transmission ≥ {THRESHOLD_NOTE})")
+                 f"{SMOOTH_MIN:.0f}-min Gaussian smoothing; '% transparency' = "
+                 f"sky clear above {ALT_MIN_NOTE:.0f}° (transmission ≥ "
+                 f"{THRESHOLD_NOTE})")
     ax.grid(alpha=0.3)
 
     ax2 = ax.twinx()
-    ax2.plot(bin_centers, transp, color="#2c3e50", lw=2.4, alpha=0.85,
+    ax2.plot(hrs, transp, color="#2c3e50", lw=2.4, alpha=0.85,
              label="% sky transparency (>30°)")
     ax2.set_ylabel("% sky clear above 30°", color="#2c3e50")
     ax2.set_ylim(0, 100)
