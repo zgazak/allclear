@@ -46,7 +46,7 @@ from allclear.transmission import compute_transmission, interpolate_transmission
 
 DEFAULT_FRAME = Path("benchmark/data/apicam_drift_seasonal/"
                      "APICAM.2019-06-06T00:59:45.000.fits")
-DEFAULT_MODEL = Path("benchmark/results/apicam_seasonal_blind/"
+DEFAULT_MODEL = Path("benchmark/results/apicam_seasonal_blind_paper/"
                      "APICAM.2019-06-06T00:59:45.000_model.json")
 DEFAULT_MASK = Path("benchmark/results/obscuration/obscuration_map.json")
 
@@ -166,7 +166,8 @@ def run_blind(data_m, cat, det_m, initial_f, mask=None,
 
 def run_solve(data_m, cat, det_m, camera, ref_zp, mask=None):
     t0 = time.time()
-    result = fast_solve(data_m, det_m, cat, camera, obscuration=mask)
+    result = fast_solve(data_m, det_m, cat, camera, obscuration=mask,
+                        fix_center=True)
     elapsed = time.time() - t0
 
     use_det = (result.guided_det_table

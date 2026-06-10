@@ -131,8 +131,9 @@ def _render(mask):
     ax1.set_theta_zero_location("S")
     ax1.set_theta_direction(-1)
     ax1.set_rlabel_position(0)
-    ax1.set_yticks([0, 30, 60, 90])
-    ax1.set_yticklabels(["90°", "60°", "30°", "0°"])
+    ax1.set_yticks([30, 60, 90])
+    ax1.set_yticklabels(["60°", "30°", "0°"])
+    ax1.set_ylim(0, 90)          # horizon (alt=0) is the hard outer edge
     ax1.set_title(f"Clear-sky visits per bin\n(gate $f_c$≥{CLEAR_GATE},"
                   f" {VMAG_MIN}<V<{VMAG_MAX})")
     fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.08)
@@ -144,8 +145,9 @@ def _render(mask):
     ax2.set_theta_zero_location("S")
     ax2.set_theta_direction(-1)
     ax2.set_rlabel_position(0)
-    ax2.set_yticks([0, 30, 60, 90])
-    ax2.set_yticklabels(["90°", "60°", "30°", "0°"])
+    ax2.set_yticks([30, 60, 90])
+    ax2.set_yticklabels(["60°", "30°", "0°"])
+    ax2.set_ylim(0, 90)          # horizon (alt=0) is the hard outer edge
     ax2.set_title("Detection fraction\n(1 − obscuration)")
     fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.08, label="weight")
 
