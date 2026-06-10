@@ -36,7 +36,7 @@ from allclear.utils import load_image
 
 OBS_CSV = Path("benchmark/results/obscuration/per_star_observations.csv")
 EXAMPLE_FRAME_MODEL = Path(
-    "benchmark/results/apicam_seasonal_blind/"
+    "benchmark/results/apicam_seasonal_blind_paper/"
     "APICAM.2019-06-06T00:59:45.000_model.json")
 EXAMPLE_FRAME_IMG = Path(
     "benchmark/data/apicam_drift_seasonal/"
