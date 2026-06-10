@@ -106,7 +106,8 @@ def render_panel(frame_path, model_path, bin_name, camera_label, cat):
         det["x"] = (data.shape[1] - 1) - np.asarray(det["x"], dtype=np.float64)
 
     camera = inst.to_camera_model()
-    result = fast_solve(data, det, cat_table, camera, guided=True)
+    result = fast_solve(data, det, cat_table, camera, guided=True,
+                        fix_center=True)
     use_det = result.guided_det_table
     ref_zp = inst.photometric_zeropoint or None
     az, alt, trans, zp = compute_transmission(

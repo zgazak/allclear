@@ -37,7 +37,7 @@ from allclear.transmission import compute_transmission, interpolate_transmission
 from allclear.utils import load_image, parse_fits_header
 
 FRAMES_DIR = Path("benchmark/data/apicam_drift_seasonal")
-MODELS_DIR = Path("benchmark/results/apicam_seasonal_blind")
+MODELS_DIR = Path("benchmark/results/apicam_seasonal_blind_paper")
 OUT_CSV = Path("benchmark/results/obscuration/per_star_observations.csv")
 
 VMAG_LIMIT = 6.5

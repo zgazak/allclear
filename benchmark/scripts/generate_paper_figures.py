@@ -191,7 +191,7 @@ def load_and_solve(cam_cfg, root):
         data = data[:, ::-1]
         det["x"] = (data.shape[1] - 1) - np.asarray(det["x"], dtype=np.float64)
 
-    result = fast_solve(data, det, cat, camera_model)
+    result = fast_solve(data, det, cat, camera_model, fix_center=True)
 
     # Use guided det table if available (centroided positions)
     use_det = result.guided_det_table if result.guided_det_table is not None else det
