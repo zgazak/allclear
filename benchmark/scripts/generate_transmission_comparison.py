@@ -207,9 +207,12 @@ def main():
                else det)
 
     # --- "Before" transmission ---
-    log.info("\nComputing BEFORE (stale zp, binary probing)...")
+    # Same (reference) zeropoint as the "after" panel, so the panels
+    # differ ONLY in the probing of unmatched positions (binary vs
+    # measured) -- the effect the text describes.
+    log.info("\nComputing BEFORE (reference zp, binary probing)...")
     before_az, before_alt, before_trans, before_zp = \
-        compute_before(data, cat, result, stale_zp)
+        compute_before(data, cat, result, clear_zp)
 
     # --- "After" transmission ---
     log.info("\nComputing AFTER (correct zp, measured probing)...")
@@ -250,29 +253,19 @@ def main():
                     bbox=dict(boxstyle="round,pad=0.3",
                               facecolor="black", alpha=0.8,
                               edgecolor="none"))
-    ax_before.set_title("(a) Stale zeropoint, no unmatched probing",
+    ax_before.set_title("(a) Binary probe: matched stars only",
                         color="white", fontsize=9, pad=3,
                         bbox=dict(boxstyle="round,pad=0.3",
                                   facecolor="black", alpha=0.8,
                                   edgecolor="none"))
-    ax_after.set_title("(b) Auto-upgraded zeropoint, measured probing",
+    ax_after.set_title("(b) Measured probe: flux at every position",
                        color="white", fontsize=9, pad=3,
                        bbox=dict(boxstyle="round,pad=0.3",
                                  facecolor="black", alpha=0.8,
                                  edgecolor="none"))
 
-    # Zeropoint annotations
-    zp_kw = dict(color="white", fontsize=7, ha="left", va="bottom",
-                 bbox=dict(boxstyle="round,pad=0.2",
-                           facecolor="black", alpha=0.7,
-                           edgecolor="none"))
-    ax_before.text(nx * 0.02, ny * 0.02,
-                   f"ZP = {before_zp:.3f}  (model)",
-                   transform=ax_before.transData, **zp_kw)
-    ax_after.text(nx * 0.02, ny * 0.02,
-                  f"ZP = {after_zp:.3f}  (auto-upgraded)",
-                  transform=ax_after.transData, **zp_kw)
-
+    # Both panels share the same clear-sky reference zeropoint; the only
+    # difference is binary vs measured probing, so no per-panel ZP label.
     fig.patch.set_facecolor("black")
 
     # Save
