@@ -238,3 +238,6 @@ ALLSKY_CLOUD_DETECTION_PROMPT.md
 # AllClear: benchmark outputs and solved models — kept locally, not in repo
 benchmark/results/
 benchmark/solutions/
+
+# AllClear: consolidated paper (tex + figures), edited separately
+paper/
