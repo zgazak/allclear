@@ -67,6 +67,10 @@ allclear instrument-fit \
     --output instrument_model.json
 ```
 
+If a fully blind solve struggles on an unusual camera, bootstrap interactively
+with `allclear manual-fit --frames your_sky_image.fits` — click a few known
+bright stars or planets to seed the geometry, then let the solver refine.
+
 ### 2. Process frames with known model (fast)
 
 ```
@@ -93,6 +97,22 @@ allclear check \
 
 Reports overall clear fraction and transmission at a specific sky position.
 
+### 4. (Optional) Mask fixed obstructions
+
+Most installations have domes, telescopes, or trees permanently blocking part of
+the sky. Build an obscuration mask from a set of clear-sky frames so those
+regions are excluded from matching and transmission instead of being read as
+cloud:
+
+```
+allclear calibrate obscuration \
+    --model instrument_model.json \
+    --frames "clear_nights/*.fits"
+```
+
+This writes a `<model>_obscuration.json` sidecar that `solve` and `check` load
+automatically when it sits next to the model file.
+
 ## Camera model
 
 The fisheye projection model supports four lens types, selected automatically
@@ -115,6 +135,17 @@ and picks the one that produces more star matches.
 The instrument model is saved as a JSON file with camera geometry,
 site coordinates, detection settings, photometric zeropoint, mirror flag,
 and fit quality metadata.
+
+### Conventions
+
+- **Angles** are radians internally; the CLI and printed output use degrees.
+- **Pixel coordinates** follow the FITS convention: origin at lower-left, with
+  y increasing upward.
+- **Distortion**: `k1 <= 0` (barrel distortion) for physical fisheye lenses.
+- **Rotation** decomposes as `R = Rz(-rho) * Rx(-tilt) * Rz(-az0)`. Near the
+  zenith, `az0` and `rho` are partially degenerate (they produce nearly
+  identical image rotation), so the solver fixes `az0 = 0` early and splits the
+  rotation out later.
 
 ## Transmission mapping
 
@@ -147,25 +178,43 @@ flipped optical train). See [`benchmark/README.md`](benchmark/README.md) for
 dataset download scripts, ground-truth labels, and reproducible experiments
 (yearly blind-fit robustness + nightly tracking).
 
+## Limitations
+
+- **Saturated bright stars** (V ≲ 1.5 on a 16-bit sensor) clip at the pixel
+  ceiling, so their measured transmission reads artificially low — a known
+  artifact, not real cloud.
+- **Planets and the Moon** are not in the stellar catalog. Bright planets
+  (e.g. Jupiter) appear as unmatched sources, and while the Moon is labeled in
+  plots, strong moonlight raises the local sky background near it.
+- **Sensor edge and dead columns** can produce spurious detections; the
+  obscuration mask and magnitude gating mitigate this.
+- **Rotating mounts without field derotation** (roll that changes from frame to
+  frame) are not yet supported. Fixed mounts and derotated tracking mounts
+  (stable roll) are handled.
+
 ## Project structure
 
 ```
 allclear/
     __init__.py          # Package init
-    cli.py               # Command-line interface (instrument-fit, solve, check)
+    cli.py               # Command-line interface (instrument-fit, solve, check, calibrate, manual-fit)
+    api.py               # Python API (SkyTransmissionResult, satellite link queries)
     strategies.py        # Blind solve pipeline, pattern matching, guided refinement
     solver.py            # Fast solve with known model (guided matching + pointing refinement)
+    monitor.py           # Operational wrapper (model auto-update, history tracking)
     instrument.py        # InstrumentModel dataclass + JSON persistence
     projection.py        # Fisheye camera model (4 projection types, sky<->pixel)
     catalog.py           # BrightStarCatalog (Hipparcos/BSC5, refraction, extinction)
     detection.py         # Star detection (Background2D + DAOStarFinder)
     matching.py          # KDTree 1-to-1 matching, triangle-hash blind matching
     transmission.py      # Per-star photometry, RBF interpolation, TransmissionMap
+    obscuration.py       # Sky-coordinate obstruction mask (domes, trees, telescopes)
     plotting.py          # Annotated frame rendering, grid overlay, planets
+    manual_fit.py        # Interactive click-to-bootstrap camera model
     synthetic.py         # Synthetic frame generation for testing
     utils.py             # FITS I/O, coordinate math, extinction
     data/                # Cached star catalog (ECSV)
-    tests/               # Test suite (32 tests)
+    tests/               # Test suite
 benchmark/
     data/                # FITS frames from 4 cameras (downloaded via scripts)
     labels/              # Human-annotated ground truth (JSON per frame)
@@ -179,7 +228,7 @@ benchmark/
 git clone https://github.com/zgazak/allclear.git
 cd allclear
 uv sync                          # install with dev dependencies
-uv run pytest allclear/tests/ -v # run tests (32 tests)
+uv run pytest allclear/tests/ -v # run tests (88 tests)
 ```
 
 ## License
