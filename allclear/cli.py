@@ -152,6 +152,33 @@ def main(argv=None):
     p_manual.add_argument("--model", type=str, default=None,
                           help="Optional initial model JSON to start from")
 
+    # --- animate ---
+    p_anim = subparsers.add_parser(
+        "animate",
+        help="Assemble solved frames into a timelapse animation",
+    )
+    p_anim.add_argument("--frames", type=str, default=None,
+                        help="Image file(s) — path or glob (FITS/JPG/PNG/TIFF). "
+                             "Requires --model. Omit if using --input-dir.")
+    p_anim.add_argument("--model", type=str, default=None,
+                        help="Instrument model JSON file (required with --frames)")
+    p_anim.add_argument("--input-dir", type=str, default=None,
+                        help="Directory of existing solve output PNGs "
+                             "(e.g. from 'allclear solve --output-dir')")
+    p_anim.add_argument("--time", type=str, default=None,
+                        help="Observation time (UTC) override for non-FITS images")
+    p_anim.add_argument("--output", type=str, default="timelapse.webp",
+                        help="Output file — .webp (default, small), .gif, or .mp4 (requires ffmpeg)")
+    p_anim.add_argument("--fps", type=float, default=4,
+                        help="Frames per second (default: 4)")
+    p_anim.add_argument("--max-width", type=int, default=1200,
+                        help="Max output width in pixels (default: 1200)")
+    p_anim.add_argument("--mode", type=str, default="transmission",
+                        choices=["solved", "transmission", "extinction"],
+                        help="Annotation style (default: transmission)")
+    p_anim.add_argument("--threshold", type=float, default=0.7,
+                        help="Clear-sky transmission threshold (default 0.7)")
+
     args = parser.parse_args(argv)
 
     # Parse --time if provided
@@ -182,6 +209,8 @@ def main(argv=None):
     elif args.command == "calibrate":
         if args.calibrate_subcommand == "obscuration":
             return cmd_calibrate_obscuration(args)
+    elif args.command == "animate":
+        return cmd_animate(args)
 
 
 def _resolve_frames(pattern):
@@ -853,6 +882,209 @@ def cmd_manual_fit(args):
     viewer = ManualFitWeb(data, objects, cat, meta, args.output,
                           initial_model=initial_model, mirrored=mirrored)
     viewer.run()
+    return 0
+
+
+def _animate_from_dir(args):
+    """Load pre-rendered PNGs from a solve output directory."""
+    from PIL import Image
+
+    input_dir = pathlib.Path(args.input_dir)
+    if not input_dir.is_dir():
+        print(f"Directory not found: {args.input_dir}", file=sys.stderr)
+        return None
+
+    suffix = f"_{args.mode}.png"
+    png_files = sorted(input_dir.glob(f"*{suffix}"))
+    if not png_files:
+        print(f"No *{suffix} files in {input_dir}", file=sys.stderr)
+        print(f"  Available modes: "
+              + ", ".join(sorted({p.stem.rsplit("_", 1)[-1]
+                                  for p in input_dir.glob("*.png")})),
+              file=sys.stderr)
+        return None
+
+    print(f"Loading {len(png_files)} {args.mode} frames from {input_dir}")
+    pil_frames = []
+    for p in png_files:
+        img = Image.open(p).convert("RGB")
+        w, h = img.size
+        if w > args.max_width:
+            scale = args.max_width / w
+            img = img.resize((args.max_width, int(h * scale)), Image.LANCZOS)
+        pil_frames.append(img)
+
+    return pil_frames
+
+
+def _animate_from_frames(args):
+    """Solve frames from scratch and render to PIL images."""
+    from .instrument import InstrumentModel
+    from .solver import fast_solve
+    from .transmission import compute_transmission
+    from .plotting import plot_frame
+    from .utils import load_image, extract_obs_time, parse_fits_header
+    from PIL import Image
+    import io
+    import matplotlib.pyplot as plt
+
+    model_file = pathlib.Path(args.model)
+    if not model_file.exists():
+        print(f"Model file not found: {args.model}", file=sys.stderr)
+        return None
+
+    inst = InstrumentModel.load(model_file)
+    camera = inst.to_camera_model()
+
+    frames = _resolve_frames(args.frames)
+    if not frames:
+        print(f"No matching image files: {args.frames}", file=sys.stderr)
+        return None
+
+    # Extract observation times for chronological sorting
+    frame_times = []
+    for fpath in frames:
+        try:
+            _, header = load_image(str(fpath))
+            if header is not None:
+                meta = parse_fits_header(header)
+                obs_time = args._obs_time or meta["obs_time"]
+            else:
+                obs_time = args._obs_time or extract_obs_time(fpath)
+            frame_times.append((fpath, obs_time))
+        except Exception as e:
+            print(f"  SKIP {fpath.name}: cannot read time ({e})")
+
+    if not frame_times:
+        print("No frames with valid observation times.", file=sys.stderr)
+        return None
+
+    # Sort chronologically (frames without times go to the end)
+    frame_times.sort(key=lambda ft: ft[1].jd if ft[1] is not None else float("inf"))
+
+    print(f"Animating {len(frame_times)} frame(s) with model {args.model}")
+    if frame_times[0][1] and frame_times[-1][1]:
+        print(f"  Time range: {frame_times[0][1].iso} -> {frame_times[-1][1].iso}")
+
+    pil_frames = []
+    for i, (fpath, obs_time) in enumerate(frame_times):
+        try:
+            data, meta, cat, det, _ = _load_frame(
+                str(fpath), inst.site_lat, inst.site_lon,
+                obs_time=obs_time,
+            )
+        except ValueError as e:
+            print(f"  [{i+1}/{len(frame_times)}] SKIP {fpath.name}: {e}")
+            continue
+
+        result = fast_solve(data, det, cat, camera, guided=True)
+        use_det = (result.guided_det_table
+                   if result.guided_det_table is not None
+                   and len(result.guided_det_table) > 0
+                   else det)
+
+        # Build transmission/extinction overlay if requested and enough matches
+        transmission_data = None
+        if args.mode in ("transmission", "extinction") and result.n_matched >= 3:
+            ref_zp = inst.photometric_zeropoint or None
+            az, alt, trans, _ = compute_transmission(
+                use_det, cat, result.matched_pairs, result.camera_model,
+                image=data, reference_zeropoint=ref_zp,
+            )
+            transmission_data = (az, alt, trans)
+
+        # Render to in-memory image via matplotlib
+        fig, ax = plot_frame(
+            data, result.camera_model,
+            det_table=use_det, cat_table=cat,
+            matched_pairs=result.matched_pairs,
+            show_grid=True,
+            transmission_data=transmission_data,
+            overlay_mode=args.mode if args.mode != "solved" else "transmission",
+            obs_time=meta["obs_time"],
+            lat_deg=inst.site_lat, lon_deg=inst.site_lon,
+        )
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+        buf.seek(0)
+        img = Image.open(buf).convert("RGB")
+
+        # Downscale for reasonable file size
+        w, h = img.size
+        if w > args.max_width:
+            scale = args.max_width / w
+            img = img.resize((args.max_width, int(h * scale)), Image.LANCZOS)
+
+        pil_frames.append(img)
+
+        n_match_str = f"{result.n_matched}/{result.n_expected}"
+        print(f"  [{i+1}/{len(frame_times)}] {fpath.name}: {n_match_str} matches")
+
+    return pil_frames or None
+
+
+def cmd_animate(args):
+    from PIL import Image
+
+    if args.input_dir:
+        pil_frames = _animate_from_dir(args)
+    elif args.frames and args.model:
+        pil_frames = _animate_from_frames(args)
+    else:
+        print("Provide either --input-dir or both --frames and --model.",
+              file=sys.stderr)
+        return 1
+
+    if not pil_frames:
+        print("No frames rendered successfully.", file=sys.stderr)
+        return 1
+
+    # Ensure all frames are the same size (pad/crop to first frame's size)
+    target_size = pil_frames[0].size
+    for i in range(1, len(pil_frames)):
+        if pil_frames[i].size != target_size:
+            pil_frames[i] = pil_frames[i].resize(target_size, Image.LANCZOS)
+
+    duration_ms = int(1000 / args.fps)
+    output_path = pathlib.Path(args.output)
+    ext = output_path.suffix.lower()
+
+    if ext == ".mp4":
+        import subprocess
+        import shutil
+        if not shutil.which("ffmpeg"):
+            print("Error: mp4 output requires ffmpeg. "
+                  "Use .webp or .gif, or install ffmpeg.", file=sys.stderr)
+            return 1
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for idx, frame in enumerate(pil_frames):
+                frame.save(pathlib.Path(tmpdir) / f"{idx:06d}.png")
+            subprocess.run([
+                "ffmpeg", "-y", "-framerate", str(args.fps),
+                "-i", str(pathlib.Path(tmpdir) / "%06d.png"),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(output_path),
+            ], check=True, capture_output=True)
+    elif ext == ".webp":
+        pil_frames[0].save(
+            output_path, save_all=True, append_images=pil_frames[1:],
+            duration=duration_ms, loop=0, quality=80, method=4,
+        )
+    else:
+        # GIF fallback
+        quantized = [f.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+                     for f in pil_frames]
+        quantized[0].save(
+            output_path, save_all=True, append_images=quantized[1:],
+            duration=duration_ms, loop=0, optimize=True,
+        )
+
+    file_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"Saved {output_path} ({len(pil_frames)} frames, {file_mb:.1f} MB)")
+
     return 0
 
 
