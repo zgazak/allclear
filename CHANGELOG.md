@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Satellite link-obscuration queries** on `SkyTransmissionResult` (optional
   `sgp4` dependency, installable via the `satellite` extra).
 - **`manual-fit` GUI**: interactive bootstrap by clicking known objects.
+- **`animate` subcommand**: assemble many frames into a timelapse, either by
+  re-solving raw frames (`--frames` + `--model`) or stitching a previous
+  `solve --output-dir` run (`--input-dir`). Outputs `.webp`/`.gif`/`.mp4`
+  (mp4 needs `ffmpeg`), with `--mode solved|transmission|extinction`.
+- **Extinction overlay mode** and an inset colorbar on annotated frames; frame
+  timestamp and clip-margin-aware grid labels.
 
 ### Changed
 - **Transmission now always normalizes to the model reference zeropoint** when
