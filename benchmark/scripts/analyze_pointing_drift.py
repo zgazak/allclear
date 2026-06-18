@@ -89,10 +89,7 @@ def save_frame_images(data, result, meta, cat, inst, fpath, output_dir,
     """Save annotated solved + transmission images for a frame."""
     from allclear.transmission import compute_transmission
 
-    if backend == "inkblot":
-        from allclear.plotting_inkblot import plot_frame as _plot_frame
-    else:
-        from allclear.plotting import plot_frame as _plot_frame
+    from allclear.plotting import plot_frame as _plot_frame
 
     def _save_annotated_image(data, model, det, cat, output_path,
                               matched_pairs=None, transmission_data=None,
@@ -545,7 +542,7 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["matplotlib", "inkblot"],
+        choices=["matplotlib"],
         default="matplotlib",
         help="Plotting backend (default: matplotlib).",
     )
