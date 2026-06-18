@@ -3,7 +3,7 @@ name = "allclear"
 authors = [
   { name="Zach", email="jzg@alum.mit.edu" },
 ]
-version = "1.0.0"
+version = "0.3.0"
 description = "All-sky camera cloud detection via stellar transmission mapping"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,6 @@ dependencies = [
     "astropy",
     "photutils",
     "matplotlib",
-    "pyvo>=1.8.1",
 ]
 
 [project.optional-dependencies]
@@ -60,14 +59,29 @@ exclude = [
     "*.png",
     "*.gif",
     "*.jpg",
+    "*.svg",
     "*.json",
     "example_images/",
     "catalog/",
     "extr/",
     ".claude/",
+    ".github/",
+    "benchmark/",
+    "paper/",
+    "docs/",
+    "temp/",
+    "allclear/tests/",
     ".python-version",
     "uv.lock",
+    "Makefile",
     "fit_distortion.py",
     "ALLSKY_CLOUD_DETECTION_PROMPT.md",
-    "CLAUDE.md",
+    "PAPER.md",
+    "RESUME.md",
+    "NEXT_SESSION_PROMPT.md",
+]
+
+[tool.hatch.build.targets.wheel]
+exclude = [
+    "allclear/tests/",
 ]
