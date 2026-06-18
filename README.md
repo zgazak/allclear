@@ -113,6 +113,34 @@ allclear calibrate obscuration \
 This writes a `<model>_obscuration.json` sidecar that `solve` and `check` load
 automatically when it sits next to the model file.
 
+### 5. (Optional) Build a timelapse animation
+
+Assemble many frames into a timelapse — handy for reviewing a whole night at a
+glance. Either re-render from raw frames with a known model:
+
+```
+allclear animate \
+    --frames "sky_images/*.fits" \
+    --model instrument_model.json \
+    --mode transmission \
+    --output night.webp
+```
+
+or stitch the PNGs a previous `solve --output-dir` run already produced
+(fast, no re-solving):
+
+```
+allclear animate \
+    --input-dir solve_output/ \
+    --mode transmission \
+    --output night.webp
+```
+
+`--mode` selects the annotation style: `solved`, `transmission`, or
+`extinction` (extinction in magnitudes). The output format follows the file
+extension — `.webp` (default, compact), `.gif`, or `.mp4` (requires `ffmpeg`).
+Control playback with `--fps` and frame size with `--max-width`.
+
 ## Camera model
 
 The fisheye projection model supports four lens types, selected automatically
@@ -197,7 +225,7 @@ dataset download scripts, ground-truth labels, and reproducible experiments
 ```
 allclear/
     __init__.py          # Package init
-    cli.py               # Command-line interface (instrument-fit, solve, check, calibrate, manual-fit)
+    cli.py               # Command-line interface (instrument-fit, solve, check, calibrate, manual-fit, animate)
     api.py               # Python API (SkyTransmissionResult, satellite link queries)
     strategies.py        # Blind solve pipeline, pattern matching, guided refinement
     solver.py            # Fast solve with known model (guided matching + pointing refinement)
