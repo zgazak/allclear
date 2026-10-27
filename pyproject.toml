@@ -78,7 +78,6 @@ exclude = [
     "ALLSKY_CLOUD_DETECTION_PROMPT.md",
     "PAPER.md",
     "RESUME.md",
-    "NEXT_SESSION_PROMPT.md",
 ]
 
 [tool.hatch.build.targets.wheel]
