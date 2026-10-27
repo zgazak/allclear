@@ -255,7 +255,7 @@ benchmark/
 ```bash
 git clone https://github.com/zgazak/allclear.git
 cd allclear
-uv sync                          # install with dev dependencies
+uv sync --all-extras             # install with dev dependencies
 uv run pytest allclear/tests/ -v # run tests (88 tests)
 ```
 
