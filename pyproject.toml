@@ -3,17 +3,16 @@ name = "allclear"
 authors = [
   { name="Zach", email="jzg@alum.mit.edu" },
 ]
-version = "0.3.0"
+version = "0.4.0"
 description = "All-sky camera cloud detection via stellar transmission mapping"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 license-files = ["LICENSE*"]
 keywords = ["astronomy", "cloud-detection", "all-sky", "fisheye", "photometry", "transmission"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

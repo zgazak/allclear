@@ -261,4 +261,10 @@ uv run pytest allclear/tests/ -v # run tests (88 tests)
 
 ## License
 
-See [LICENSE](LICENSE).
+Copyright (C) 2026 Exoptica, Inc.
+
+AllClear is licensed under the GNU Affero General Public License v3.0 or later
+(AGPL-3.0-or-later). Anyone may use, modify, and redistribute it, including
+commercially. If you distribute AllClear or a modified version, or run a
+modified version as a network service, you must make your source available
+under the same license. See [LICENSE](LICENSE) for the full terms.
